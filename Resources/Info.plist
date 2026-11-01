@@ -30,6 +30,8 @@
     <string>public.app-category.music</string>
     <key>NSHighResolutionCapable</key>
     <true/>
+    <key>NSAudioCaptureUsageDescription</key>
+    <string>Discette listens to Music or Spotify only to move its visualizer bars. Nothing is recorded or saved.</string>
     <key>NSAppleEventsUsageDescription</key>
     <string>Discette reads what is playing in Apple Music and Spotify so it can spin the record, show lyrics and control playback.</string>
 </dict>

@@ -28,7 +28,12 @@ final class MenuBarController: NSObject {
     }
 
     func setTitle(_ title: String?) {
-        item.button?.title = title.map { " " + $0 } ?? ""
+        guard let button = item.button else { return }
+        let text = title.map { " " + $0 } ?? ""
+        if button.title != text { button.title = text }
+        // Icon only when there's no title: no extra padding next to other menu bar items.
+        let position: NSControl.ImagePosition = text.isEmpty ? .imageOnly : .imageLeading
+        if button.imagePosition != position { button.imagePosition = position }
     }
 
     @objc private func clicked(_ sender: NSStatusBarButton) {

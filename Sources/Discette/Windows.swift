@@ -1,4 +1,6 @@
 import AppKit
+import DiscetteCore
+import ScreenCaptureKit
 import SwiftUI
 
 // MARK: - Panel events
@@ -100,6 +102,9 @@ final class FloatingPanel: NSPanel {
         hidesOnDeactivate = false
         isReleasedWhenClosed = false
         host = NSHostingController(rootView: root)
+        // place() sizes and anchors the window. Left on, SwiftUI resized it to fit by itself,
+        // pinned at the top-left, so the mini disc ended up in the card's top-left corner.
+        host.sizingOptions = []
         host.view.autoresizingMask = [.width, .height]
         contentView = host.view
         if !setFrameUsingName("Discette.\(name)"), let screen = NSScreen.main?.visibleFrame {
@@ -125,7 +130,8 @@ final class FloatingPanel: NSPanel {
         case .topRight: (left, bottom) = (false, false)
         case .bottomLeft: (left, bottom) = (true, true)
         case .bottomRight: (left, bottom) = (false, true)
-        case .free: (left, bottom) = (current.midX < visible.midX, current.midY < visible.midY)
+        // Free: shrink into, and grow back out of, the player's own bottom-right corner.
+        case .free: (left, bottom) = (false, true)
         }
         let pinned = pin != .free
         var x = left ? (pinned ? visible.minX : current.minX) : (pinned ? visible.maxX : current.maxX) - size.width
@@ -134,6 +140,79 @@ final class FloatingPanel: NSPanel {
         y = min(max(y, visible.minY), visible.maxY - size.height)
         let target = NSRect(x: x, y: y, width: size.width, height: size.height).integral
         if target != current { setFrame(target, display: true) }
+    }
+}
+
+// MARK: - What's behind the player
+
+/// Tells whether the screen behind the player is light or dark, so the Liquid Glass look can
+/// switch its text and buttons between black and white. It looks at a 24 x 24 thumbnail of the
+/// area under the card (Discette's own windows left out) every 2 s, only while the glass look
+/// is showing. Needs Screen Recording permission; without it the player keeps the system look.
+@MainActor
+final class BackdropSampler {
+    /// true = light backdrop (black text), false = dark (white text), nil = unknown (system look).
+    var onChange: (Bool?) -> Void = { _ in }
+    private(set) var light: Bool?
+    private var timer: Timer?
+    private weak var window: NSWindow?
+    private var busy = false
+
+    static var isAllowed: Bool { CGPreflightScreenCaptureAccess() }
+    static func requestAccess() { CGRequestScreenCaptureAccess() }
+
+    func update(window: NSWindow, active: Bool) {
+        self.window = window
+        if active, Self.isAllowed {
+            guard timer == nil else { return }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in self?.sample() }
+            timer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
+                MainActor.assumeIsolated { self?.sample() }
+            }
+        } else {
+            timer?.invalidate()
+            timer = nil
+            if light != nil { light = nil; onChange(nil) }
+        }
+    }
+
+    private func sample() {
+        guard !busy, let window, window.isVisible, let screen = window.screen,
+              let id = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID else { return }
+        let card = window.frame.insetBy(dx: PlayerCard.margin, dy: PlayerCard.margin)
+        guard card.width > 4, card.height > 4 else { return }
+        // ScreenCaptureKit measures from the display's top-left corner.
+        let rect = CGRect(x: card.minX - screen.frame.minX, y: screen.frame.maxY - card.maxY,
+                          width: card.width, height: card.height)
+        busy = true
+        Task { [weak self] in
+            let luminance = try? await Self.luminance(display: id, rect: rect)
+            guard let self else { return }
+            self.busy = false
+            guard let luminance, self.timer != nil else { return }
+            let next = Backdrop.prefersDarkText(luminance: luminance, current: self.light)
+            if next != self.light {
+                self.light = next
+                self.onChange(next)
+            }
+        }
+    }
+
+    private nonisolated static func luminance(display id: CGDirectDisplayID, rect: CGRect) async throws -> Double? {
+        let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+        guard let display = content.displays.first(where: { $0.displayID == id }) else { return nil }
+        let own = content.applications.filter { $0.processID == ProcessInfo.processInfo.processIdentifier }
+        let config = SCStreamConfiguration()
+        config.sourceRect = rect
+        config.width = 24
+        config.height = 24
+        config.showsCursor = false
+        let image = try await SCScreenshotManager.captureImage(
+            contentFilter: SCContentFilter(display: display, excludingApplications: own, exceptingWindows: []),
+            configuration: config)
+        let pixels = image.samplePixels(side: 16)
+        guard !pixels.isEmpty else { return nil }
+        return pixels.reduce(0) { $0 + $1.luminance } / Double(pixels.count)
     }
 }
 
@@ -159,29 +238,55 @@ final class FullScreenWatcher {
         }
     }
 
-    /// Any visible, normal-level window from another app that covers a whole display counts,
-    /// not only the frontmost app's: focus can sit elsewhere (another window, or Discette itself)
-    /// while a full-screen video or app fills the screen.
+    /// The frontmost app counts as full screen when macOS says its window is, or when one of its
+    /// own normal windows covers a whole display. Only the frontmost app: background windows that
+    /// happen to be screen-sized (wallpaper and overlay apps) made the player shrink on the desktop.
+    private let checkQueue = DispatchQueue(label: "app.discette.fullscreen", qos: .utility)
+    private var checking = false
+
     func check() {
         let ownPID = ProcessInfo.processInfo.processIdentifier
+        guard !checking, let front = NSWorkspace.shared.frontmostApplication else { return }
+        // While Discette itself is in front (settings, full-screen player) keep the last answer.
+        if front.processIdentifier == ownPID { return }
+        let pid = front.processIdentifier
+        let name = front.localizedName ?? "-"
+        let screens = NSScreen.screens.map(\.frame.size)
+        checking = true
+        // Off the main thread: asking another app over Accessibility waits for it to answer,
+        // and a busy app made the player stutter.
+        checkQueue.async { [weak self] in
+            let (full, owner) = Self.isFullScreen(pid: pid, name: name, screens: screens)
+            DispatchQueue.main.async {
+                self?.checking = false
+                self?.report(full, owner: owner)
+            }
+        }
+    }
+
+    private nonisolated static func isFullScreen(pid: pid_t, name: String, screens: [CGSize]) -> (Bool, String) {
+        // 1. Ask macOS (Accessibility): reliable for native full screen, including notched Macs.
+        if AccessibilityAccess.focusedWindowIsFullScreen(pid: pid) { return (true, name) }
+        // 2. Borderless full-screen windows (games, presentations) that cover the whole display,
+        //    notch included. Exact screen size only: a maximised window is shorter.
         let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID)
             as? [[String: Any]] ?? []
-        let screens = NSScreen.screens.map(\.frame.size)
         let match = windows.first { w in
-            guard let pid = (w[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value, pid != ownPID,
+            guard (w[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value == pid,
                   (w[kCGWindowLayer as String] as? NSNumber)?.intValue == 0,
                   ((w[kCGWindowAlpha as String] as? NSNumber)?.doubleValue ?? 1) > 0.01,
                   let bounds = w[kCGWindowBounds as String] as? NSDictionary,
                   let rect = CGRect(dictionaryRepresentation: bounds as CFDictionary) else { return false }
             return screens.contains { abs($0.width - rect.width) < 1 && abs($0.height - rect.height) < 1 }
         }
-        let full = match != nil
-        if full != isFullScreen {
-            isFullScreen = full
-            NSLog("Discette: full screen elsewhere = %@ (%@)", full ? "yes" : "no",
-                  (match?[kCGWindowOwnerName as String] as? String) ?? "-")
-            onChange(full)
-        }
+        return (match != nil, (match?[kCGWindowOwnerName as String] as? String) ?? "-")
+    }
+
+    private func report(_ full: Bool, owner: String) {
+        guard full != isFullScreen else { return }
+        isFullScreen = full
+        NSLog("Discette: full screen elsewhere = %@ (%@)", full ? "yes" : "no", owner)
+        onChange(full)
     }
 }
 

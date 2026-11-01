@@ -9,12 +9,12 @@ import SwiftUI
 // of the cover colours (Paper), or the system material (Liquid Glass). Every pair is checked
 // for contrast; Reduce Transparency turns glass into Graphite; Increase Contrast strengthens
 // hairlines and secondary text.
-// Shape: card 22pt continuous, sleeve 4pt, controls are circles.
+// Shape: card 26pt continuous, sleeve 4pt. Controls: bare glyphs, one solid play/pause disc.
 // Motion: the record turns at 33 1/3 rpm and slides out of its sleeve while playing. Reduce
 // Motion stops both.
 
 enum Radius {
-    static let card: CGFloat = 22
+    static let card: CGFloat = 26
     static let sleeve: CGFloat = 4
     static let thumb: CGFloat = 6
 }
@@ -37,6 +37,9 @@ struct Look: Equatable {
     var onAccent: Color
     var hairline: Color
     var sleeveBlank: Color
+    /// The play/pause disc and its glyph: the strongest pair the look has.
+    var primary: Color
+    var onPrimary: Color
     /// Liquid Glass only: 0 = frosted, 1 = clear.
     var glassClarity: Double = 0.6
     /// Liquid Glass only: 0 = no tint, 1 = strong album-colour tint.
@@ -50,7 +53,7 @@ struct Look: Equatable {
                  muted: (increaseContrast ? p.text : p.muted).color,
                  accent: p.accent.color, onAccent: p.background.color,
                  hairline: increaseContrast ? p.text.color.opacity(0.5) : p.surface.color,
-                 sleeveBlank: p.surface.color)
+                 sleeveBlank: p.surface.color, primary: p.accent.color, onPrimary: p.background.color)
         }
         switch look {
         case .album:
@@ -68,7 +71,9 @@ struct Look: Equatable {
             return Look(fill: nil, text: .primary, muted: .secondary, accent: palette.accent.color,
                         onAccent: palette.background.color,
                         hairline: .white.opacity(increaseContrast ? 0.45 : 0.16),
-                        sleeveBlank: Color.primary.opacity(0.12))
+                        sleeveBlank: Color.primary.opacity(0.12),
+                        // Black on a light backdrop, white on a dark one (see BackdropSampler).
+                        primary: .primary, onPrimary: Color(nsColor: .windowBackgroundColor))
         }
     }
 }
@@ -95,6 +100,14 @@ struct CardSurface: ViewModifier {
             }
         }
         .overlay(shape.strokeBorder(look.hairline, lineWidth: 1).allowsHitTesting(false))
+        .overlay {
+            // Light catching the rim of the glass.
+            if look.isGlass {
+                shape.strokeBorder(LinearGradient(colors: [.white.opacity(0.55), .white.opacity(0.04), .white.opacity(0.22)],
+                                                  startPoint: .topLeading, endPoint: .bottomTrailing), lineWidth: 1.2)
+                    .allowsHitTesting(false)
+            }
+        }
         .shadow(color: .black.opacity(0.32), radius: 22, y: 14)
     }
 }
@@ -119,51 +132,117 @@ struct LookReader<Content: View>: View {
 
 // MARK: - Record, sleeve, turntable
 
+/// The record label, turned by Core Animation at 33 1/3 rpm. The window server runs the
+/// rotation itself, at the display's frame rate, so it never hitches and costs the app nothing per
+/// frame. (Driving it from the polled song position made it jump about every half turn.) When the
+/// music pauses it stops where it is and carries on from there.
+struct SpinningLabel: NSViewRepresentable {
+    let artwork: NSImage?
+    let color: NSColor
+    let spinning: Bool
+
+    func makeNSView(context: Context) -> LabelView { LabelView() }
+
+    func updateNSView(_ view: LabelView, context: Context) {
+        view.update(artwork: artwork, color: color, spinning: spinning)
+    }
+
+    final class LabelView: NSView {
+        private let disc = CALayer()
+        private weak var shownArtwork: NSImage?
+        private var isSpinning = false
+        private var angle = 0.0
+
+        override init(frame: NSRect) {
+            super.init(frame: frame)
+            wantsLayer = true
+            disc.masksToBounds = true
+            disc.contentsGravity = .resizeAspectFill
+            layer?.addSublayer(disc)
+        }
+
+        required init?(coder: NSCoder) { fatalError("not used") }
+
+        override func layout() {
+            super.layout()
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            disc.frame = bounds
+            disc.cornerRadius = bounds.width / 2
+            CATransaction.commit()
+        }
+
+        func update(artwork: NSImage?, color: NSColor, spinning: Bool) {
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            if artwork !== shownArtwork || artwork == nil {
+                disc.contents = artwork?.cgImage(forProposedRect: nil, context: nil, hints: nil)
+                shownArtwork = artwork
+            }
+            disc.backgroundColor = color.cgColor
+            CATransaction.commit()
+            guard spinning != isSpinning else { return }
+            isSpinning = spinning
+            if spinning {
+                let turn = CABasicAnimation(keyPath: "transform.rotation.z")
+                turn.fromValue = angle
+                turn.toValue = angle - 2 * .pi   // negative is clockwise here
+                turn.duration = 1.8              // 33 1/3 rpm
+                turn.repeatCount = .infinity
+                turn.isRemovedOnCompletion = false
+                disc.add(turn, forKey: "spin")
+            } else {
+                angle = (disc.presentation()?.value(forKeyPath: "transform.rotation.z") as? Double) ?? angle
+                CATransaction.begin()
+                CATransaction.setDisableActions(true)
+                disc.removeAnimation(forKey: "spin")
+                disc.setValue(angle, forKeyPath: "transform.rotation.z")
+                CATransaction.commit()
+            }
+        }
+    }
+}
+
 struct RecordDisc: View {
     let diameter: CGFloat
-    let angle: Double
+    var spinning = false
     let artwork: NSImage?
     let labelColor: Color
 
     var body: some View {
-        Canvas { ctx, _ in
-            let r = diameter / 2
-            let c = CGPoint(x: r, y: r)
-            let disc = CGRect(x: 0, y: 0, width: diameter, height: diameter)
-            ctx.fill(Path(ellipseIn: disc), with: .radialGradient(
-                Gradient(colors: [Color(white: 0.12), Color(white: 0.045)]), center: c, startRadius: r * 0.3, endRadius: r))
-            ctx.stroke(circlePath(c, r * 0.985), with: .color(.white.opacity(0.07)), lineWidth: 1)
-            if diameter > 60 {
-                var groove = r * 0.40
-                let step = max(1.5, r * 0.018)
-                while groove < r * 0.955 {
-                    ctx.stroke(circlePath(c, groove), with: .color(.white.opacity(0.035)), lineWidth: 0.5)
-                    groove += step
+        let r = diameter / 2
+        let lr = r * 0.33
+        ZStack {
+            Canvas { ctx, _ in
+                let c = CGPoint(x: r, y: r)
+                let disc = CGRect(x: 0, y: 0, width: diameter, height: diameter)
+                ctx.fill(Path(ellipseIn: disc), with: .radialGradient(
+                    Gradient(colors: [Color(white: 0.12), Color(white: 0.045)]), center: c, startRadius: r * 0.3, endRadius: r))
+                ctx.stroke(circlePath(c, r * 0.985), with: .color(.white.opacity(0.07)), lineWidth: 1)
+                if diameter > 60 {
+                    var groove = r * 0.40
+                    let step = max(1.5, r * 0.018)
+                    while groove < r * 0.955 {
+                        ctx.stroke(circlePath(c, groove), with: .color(.white.opacity(0.035)), lineWidth: 0.5)
+                        groove += step
+                    }
+                    for f in [0.56, 0.69, 0.82] {
+                        ctx.stroke(circlePath(c, r * f), with: .color(.black.opacity(0.55)), lineWidth: max(1, r * 0.009))
+                    }
                 }
-                for f in [0.56, 0.69, 0.82] {
-                    ctx.stroke(circlePath(c, r * f), with: .color(.black.opacity(0.55)), lineWidth: max(1, r * 0.009))
-                }
+                // The sheen stays put while the record turns under it, like light on real vinyl.
+                ctx.fill(Path(ellipseIn: disc), with: .conicGradient(Gradient(stops: [
+                    .init(color: .clear, location: 0), .init(color: .white.opacity(0.10), location: 0.07),
+                    .init(color: .clear, location: 0.19), .init(color: .clear, location: 0.5),
+                    .init(color: .white.opacity(0.06), location: 0.57), .init(color: .clear, location: 0.69),
+                    .init(color: .clear, location: 1),
+                ]), center: c, angle: .degrees(-35)))
             }
-            ctx.fill(Path(ellipseIn: disc), with: .conicGradient(Gradient(stops: [
-                .init(color: .clear, location: 0), .init(color: .white.opacity(0.10), location: 0.07),
-                .init(color: .clear, location: 0.19), .init(color: .clear, location: 0.5),
-                .init(color: .white.opacity(0.06), location: 0.57), .init(color: .clear, location: 0.69),
-                .init(color: .clear, location: 1),
-            ]), center: c, angle: .degrees(-35)))
-            let lr = r * 0.33
-            let labelRect = CGRect(x: c.x - lr, y: c.y - lr, width: lr * 2, height: lr * 2)
-            var label = ctx
-            label.translateBy(x: c.x, y: c.y)
-            label.rotate(by: .degrees(angle))
-            label.translateBy(x: -c.x, y: -c.y)
-            label.clip(to: Path(ellipseIn: labelRect))
-            if let artwork {
-                label.draw(label.resolve(Image(nsImage: artwork).resizable()), in: labelRect)
-            } else {
-                label.fill(Path(ellipseIn: labelRect), with: .color(labelColor))
-            }
-            ctx.stroke(circlePath(c, lr), with: .color(.black.opacity(0.35)), lineWidth: 1)
-            ctx.fill(circlePath(c, max(1.5, r * 0.022)), with: .color(Color(white: 0.03)))
+            // Only the label turns: grooves look the same at any angle.
+            SpinningLabel(artwork: artwork, color: NSColor(labelColor), spinning: spinning)
+                .frame(width: lr * 2, height: lr * 2)
+            Circle().strokeBorder(.black.opacity(0.35), lineWidth: 1).frame(width: lr * 2, height: lr * 2)
+            Circle().fill(Color(white: 0.03)).frame(width: max(3, r * 0.044), height: max(3, r * 0.044))
         }
         .frame(width: diameter, height: diameter)
     }
@@ -197,7 +276,7 @@ struct Sleeve: View {
 /// The cover, with the record sliding out while it plays and back in when it stops.
 struct SleeveDeck: View {
     let side: CGFloat
-    let angle: Double
+    let spinning: Bool
     let playing: Bool
     let hasTrack: Bool
     let artwork: NSImage?
@@ -211,7 +290,7 @@ struct SleeveDeck: View {
         let slide = !hasTrack ? side * 0.03 : (playing ? side * 0.42 : side * 0.16)
         let motion: Animation? = reduceMotion ? nil : .spring(duration: 1.2, bounce: 0.14)
         ZStack(alignment: .topLeading) {
-            RecordDisc(diameter: d, angle: angle, artwork: artwork, labelColor: look.accent)
+            RecordDisc(diameter: d, spinning: spinning, artwork: artwork, labelColor: look.accent)
                 .shadow(color: .black.opacity(0.45), radius: 8, x: 2, y: 6)
                 .offset(x: (side - d) / 2 + slide, y: (side - d) / 2)
                 .animation(motion, value: playing)
@@ -267,7 +346,7 @@ struct ArmShape: Shape {
 /// The card itself is the plinth: platter, record and arm sit straight on it.
 struct TurntableDeck: View {
     let geo: DeckGeometry
-    let angle: Double
+    let spinning: Bool
     let playing: Bool
     let progress: Double
     let artwork: NSImage?
@@ -283,7 +362,7 @@ struct TurntableDeck: View {
                 .frame(width: geo.r * 2.06, height: geo.r * 2.06)
                 .shadow(color: .black.opacity(0.35), radius: 6, y: 4)
                 .position(geo.center)
-            RecordDisc(diameter: geo.diameter, angle: angle, artwork: artwork, labelColor: look.accent)
+            RecordDisc(diameter: geo.diameter, spinning: spinning, artwork: artwork, labelColor: look.accent)
                 .position(geo.center)
             Circle().fill(look.hairline)
                 .frame(width: geo.r * 0.24, height: geo.r * 0.24)
@@ -310,44 +389,136 @@ struct PressStyle: ButtonStyle {
     }
 }
 
-struct Transport: View {
-    @ObservedObject var hub: PlaybackHub
+/// One transport control. Secondary controls are bare glyphs with a soft circle on hover;
+/// play/pause is a solid disc in the strongest colour pair the look has, so it reads on any
+/// backdrop. Shuffle, repeat and the like show they're on with the accent colour and a dot.
+struct ControlButton: View {
+    let symbol: String
+    let label: String
     let look: Look
     var scale: CGFloat = 1
-    var keyboard = false
+    var prominent = false
+    var active = false
+    var enabled = true
+    var help: String?
+    let action: () -> Void
+    @State private var hovering = false
 
     var body: some View {
-        let playing = hub.nowPlaying?.isPlaying == true
-        HStack(spacing: 4 * scale) {
-            skip("backward.fill", "Previous track", .leftArrow) { hub.previous() }
-            Button { hub.playPause() } label: {
-                Image(systemName: playing ? "pause.fill" : "play.fill")
-                    .font(.system(size: 14 * scale, weight: .bold))
-                    .foregroundStyle(look.onAccent)
-                    .frame(width: 38 * scale, height: 38 * scale)
-                    .background(Circle().fill(look.accent))
-                    .contentShape(Circle())
-            }
-            .buttonStyle(PressStyle())
-            .keyboardShortcut(keyboard ? KeyboardShortcut(.space, modifiers: []) : nil)
-            .accessibilityLabel(playing ? "Pause" : "Play")
-            .help(playing ? "Pause" : "Play")
-            skip("forward.fill", "Next track", .rightArrow) { hub.next() }
-        }
-    }
-
-    private func skip(_ symbol: String, _ label: String, _ key: KeyEquivalent, action: @escaping () -> Void) -> some View {
+        let side = (prominent ? 36 : 28) * scale
         Button(action: action) {
             Image(systemName: symbol)
-                .font(.system(size: 13 * scale, weight: .bold))
-                .foregroundStyle(look.text)
-                .frame(width: 32 * scale, height: 32 * scale)
+                .font(.system(size: (prominent ? 14 : 13) * scale, weight: prominent ? .bold : .semibold))
+                .contentTransition(.symbolEffect(.replace))
+                .foregroundStyle(prominent ? look.onPrimary : (active ? look.accent : look.text))
+                .frame(width: side, height: side)
+                .background {
+                    if prominent {
+                        Circle().fill(look.primary).shadow(color: .black.opacity(0.2), radius: 3, y: 1.5)
+                    } else {
+                        Circle().fill(look.text.opacity(hovering && enabled ? 0.12 : 0))
+                    }
+                }
+                .overlay(alignment: .bottom) {
+                    if active, !prominent {
+                        Circle().fill(look.accent).frame(width: 3.5 * scale, height: 3.5 * scale).offset(y: -1 * scale)
+                    }
+                }
+                .scaleEffect(prominent && hovering && enabled ? 1.05 : 1)
+                .animation(.easeOut(duration: 0.15), value: hovering)
                 .contentShape(Circle())
         }
         .buttonStyle(PressStyle())
-        .keyboardShortcut(keyboard ? KeyboardShortcut(key, modifiers: []) : nil)
+        .onHover { hovering = $0 }
+        .disabled(!enabled)
+        .opacity(enabled ? 1 : 0.35)
         .accessibilityLabel(label)
-        .help(label)
+        .help(help ?? label)
+    }
+}
+
+/// The controls the user picked in Settings, in a fixed, familiar order.
+struct ControlsRow: View {
+    @ObservedObject var hub: PlaybackHub
+    let look: Look
+    let controls: [PlayerControl]
+    var scale: CGFloat = 1
+    var keyboard = false
+    /// Up next toggle; nil where there is no room for the list (menu bar, full screen).
+    var queueOpen = false
+    var onQueue: (() -> Void)?
+
+    var body: some View {
+        HStack(spacing: 6 * scale) {
+            ForEach(controls) { control in button(control) }
+        }
+    }
+
+    @ViewBuilder
+    private func button(_ control: PlayerControl) -> some View {
+        let track = hub.nowPlaying
+        switch control {
+        case .playPause:
+            let playing = track?.isPlaying == true
+            ControlButton(symbol: playing ? "pause.fill" : "play.fill", label: playing ? "Pause" : "Play",
+                          look: look, scale: scale, prominent: true) { hub.playPause() }
+                .keyboardShortcut(keyboard ? KeyboardShortcut(.space, modifiers: []) : nil)
+        case .previous:
+            ControlButton(symbol: "backward.fill", label: "Previous track", look: look, scale: scale) { hub.previous() }
+                .keyboardShortcut(keyboard ? KeyboardShortcut(.leftArrow, modifiers: []) : nil)
+        case .next:
+            ControlButton(symbol: "forward.fill", label: "Next track", look: look, scale: scale) { hub.next() }
+                .keyboardShortcut(keyboard ? KeyboardShortcut(.rightArrow, modifiers: []) : nil)
+        case .shuffle:
+            ControlButton(symbol: "shuffle", label: track?.shuffle == true ? "Shuffle is on" : "Shuffle is off",
+                          look: look, scale: scale, active: track?.shuffle == true, enabled: track?.shuffle != nil) {
+                hub.toggleShuffle()
+            }
+        case .repeatMode:
+            let mode = track?.repeatMode
+            ControlButton(symbol: mode == .one ? "repeat.1" : "repeat",
+                          label: mode == .one ? "Repeat one" : (mode == .all ? "Repeat all" : "Repeat is off"),
+                          look: look, scale: scale, active: (mode ?? .off) != .off, enabled: mode != nil) {
+                hub.cycleRepeat()
+            }
+        case .favorite:
+            let favorite = track?.favorite
+            ControlButton(symbol: favorite == true ? "heart.fill" : "heart",
+                          label: favorite == true ? "Remove from favourites" : "Add to favourites",
+                          look: look, scale: scale, active: favorite == true, enabled: favorite != nil,
+                          help: favorite == nil && track?.source == .spotify
+                              ? "Spotify doesn't let other apps save songs" : nil) {
+                hub.toggleFavorite()
+            }
+        case .queue:
+            if let onQueue {
+                ControlButton(symbol: "list.bullet", label: queueOpen ? "Hide up next" : "Show up next",
+                              look: look, scale: scale, active: queueOpen, action: onQueue)
+            }
+        }
+    }
+}
+
+/// Live levels from the player's audio, drawn as five thin bars in the accent colour.
+struct LevelBars: View {
+    @ObservedObject var visualizer: Visualizer
+    let color: Color
+    var height: CGFloat = 16
+
+    /// Watches the visualizer itself, so its 30 updates a second redraw only the bars.
+    var body: some View {
+        if visualizer.status == .running {
+            HStack(alignment: .center, spacing: 2.5) {
+                ForEach(0..<Visualizer.bandCount, id: \.self) { i in
+                    Capsule()
+                        .fill(color)
+                        .frame(width: 3, height: max(3, height * CGFloat(visualizer.levels[i])))
+                }
+            }
+            .frame(height: height)
+            .animation(.linear(duration: 0.07), value: visualizer.levels)
+            .accessibilityHidden(true)
+        }
     }
 }
 
@@ -393,7 +564,7 @@ struct Scrubber: View {
                 Spacer()
                 Text("-" + clock(max(0, duration - fraction * duration)))
             }
-            .font(.system(size: 10.5, weight: .medium).monospacedDigit())
+            .font(.system(size: 10.5, weight: .medium, design: .rounded).monospacedDigit())
             .foregroundStyle(look.muted)
             .accessibilityHidden(true)
             .allowsHitTesting(false)
@@ -433,17 +604,17 @@ struct ShrinkButton: View {
 
 // MARK: - Lyrics
 
+/// One line of lyrics that fills in as it is sung: the words appear as the song reaches them, and
+/// a long line scrolls to keep the newest words in view. Always one line, at a fixed height, so
+/// the player never changes size between songs.
 struct LyricsBlock: View {
     @ObservedObject var lyrics: LyricsController
     let look: Look
-    let position: Double
-    let lines: Int
+    let track: NowPlaying?
     let fontSize: Double
     var large = false
-    /// 0...1 through the song; moves unsynced lyrics along roughly with the music.
-    var progress: Double = 0
 
-    private var currentSize: Double { fontSize + (large ? 16 : 4) }
+    private var size: Double { fontSize + (large ? 16 : 4) }
 
     /// Unsynced text without blank lines or section labels such as "[Chorus]".
     static func plainLines(_ text: String) -> [String] {
@@ -451,56 +622,68 @@ struct LyricsBlock: View {
             .map { $0.trimmingCharacters(in: .whitespaces) }
             .filter { !$0.isEmpty && !($0.hasPrefix("[") && $0.hasSuffix("]")) }
     }
-    private var otherSize: Double { fontSize + (large ? 6 : 0) }
 
-    /// Fixed height so the player never jumps as lines change.
-    static func height(lines: Int, fontSize: Double, large: Bool) -> CGFloat {
-        let current = (fontSize + (large ? 16 : 4)) * 1.3 * 2
-        let other = (fontSize + (large ? 6 : 0)) * 1.32 + 6
-        return CGFloat(current + Double(max(0, lines - 1)) * other + 4)
+    static func height(fontSize: Double, large: Bool) -> CGFloat {
+        CGFloat((fontSize + (large ? 16 : 4)) * 1.35 + 4)
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            content
+        Group {
+            if let track, track.isPlaying, lyrics.syncedLines != nil {
+                // Redraw only at the moments a word appears or the line changes, not every frame:
+                // each redraw lays out the whole card, and doing that 15 times a second was most
+                // of Discette's CPU.
+                let now = track.position(at: Date())
+                let dates = lyrics.changePositions(from: now).map { track.positionDate.addingTimeInterval($0 - track.position) }
+                TimelineView(.explicit(dates)) { timeline in line(at: timeline.date) }
+            } else {
+                TimelineView(.animation(minimumInterval: 1, paused: !(track?.isPlaying ?? false))) { timeline in
+                    line(at: timeline.date)
+                }
+            }
         }
-        .frame(maxWidth: .infinity, alignment: .topLeading)
-        .frame(height: effectiveHeight, alignment: .topLeading)
-        .clipped()
         .allowsHitTesting(false)
-        .accessibilityElement(children: .ignore)
-        .accessibilityLabel("Lyrics")
-        .accessibilityValue(spoken)
+    }
+
+    private func line(at date: Date) -> some View {
+        // A hair past the moment, so a word due exactly now is shown.
+        let position = (track?.position(at: date) ?? 0) + 0.01
+        return content(position: position, progress: track?.progress(at: date) ?? 0)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .frame(height: effectiveHeight, alignment: .leading)
+            .clipped()
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel("Lyrics")
+            .accessibilityValue(spoken(at: position))
     }
 
     @ViewBuilder
-    private var content: some View {
+    private func content(position: Double, progress: Double) -> some View {
         switch lyrics.state {
         case .loaded(.synced(let all)):
             let current = lyrics.currentIndex(at: position)
-            let first = current ?? 0
-            ForEach(first..<min(all.count, first + lines), id: \.self) { i in
-                let isCurrent = i == current
-                Text(all[i].text.isEmpty ? "♪" : all[i].text)
-                    .font(.system(size: isCurrent ? currentSize : otherSize, weight: isCurrent ? .bold : .semibold))
-                    .tracking(isCurrent ? -0.4 : -0.2)
-                    .foregroundStyle(isCurrent ? look.text : look.muted)
-                    .lineLimit(isCurrent ? 2 : 1)
-                    .transition(.asymmetric(insertion: .opacity.combined(with: .offset(y: 10)), removal: .opacity))
+            let text = current.map { all[$0].text } ?? ""
+            let shown = current == nil ? "" : (text.isEmpty ? "♪" : LyricsSync.revealed(text, progress: lyrics.lineProgress(at: position)))
+            ZStack(alignment: .leading) {
+                Text(shown)
+                    .font(.system(size: size, weight: .bold))
+                    .tracking(-0.4)
+                    .foregroundStyle(look.text)
+                    .lineLimit(1)
+                    .truncationMode(.head)
+                    .id(current)
+                    .transition(.opacity)
             }
-            .animation(.spring(duration: 0.45, bounce: 0.1), value: current)
+            .animation(.easeOut(duration: 0.18), value: current)
         case .loaded(.plain(let text)):
             // No timing: follow the song's progress, in the secondary colour so it never
             // pretends to be exactly in sync.
             let all = Self.plainLines(text)
-            let start = all.isEmpty ? 0 : min(all.count - 1, Int(progress * Double(all.count)))
-            ForEach(start..<min(all.count, start + lines + 1), id: \.self) { i in
-                Text(all[i])
-                    .font(.system(size: otherSize + 1, weight: .semibold))
-                    .foregroundStyle(look.muted)
-                    .lineLimit(1)
-            }
-            .animation(.easeOut(duration: 0.4), value: start)
+            let i = all.isEmpty ? 0 : min(all.count - 1, Int(progress * Double(all.count)))
+            Text(all.isEmpty ? "" : all[i])
+                .font(.system(size: size - 2, weight: .semibold))
+                .foregroundStyle(look.muted)
+                .lineLimit(1)
         case .loaded(.instrumental): status("Instrumental")
         case .loading: status("Looking for lyrics…")
         case .notFound: status("No lyrics for this song")
@@ -511,21 +694,19 @@ struct LyricsBlock: View {
 
     private func status(_ text: String) -> some View {
         Text(text)
-            .font(.system(size: otherSize, weight: .medium))
+            .font(.system(size: size - 3, weight: .medium))
             .foregroundStyle(look.muted)
             .lineLimit(1)
     }
 
-    /// Full height only for synced lyrics; one line for a status; nothing when idle.
     private var effectiveHeight: CGFloat {
         switch lyrics.state {
-        case .loaded(.synced), .loaded(.plain): return Self.height(lines: lines, fontSize: fontSize, large: large)
         case .waiting, .off: return 0
-        default: return CGFloat(otherSize * 1.4)
+        default: return Self.height(fontSize: fontSize, large: large)
         }
     }
 
-    private var spoken: String {
+    private func spoken(at position: Double) -> String {
         switch lyrics.state {
         case .loaded(.synced): return lyrics.currentLine(at: position) ?? "Waiting for the first line"
         case .loaded(.plain): return "Lyrics without timing"
@@ -538,6 +719,75 @@ struct LyricsBlock: View {
     }
 }
 
+// MARK: - Up next
+
+/// The next songs from the playlist Music is playing. Click one to play it.
+struct QueueList: View {
+    @ObservedObject var hub: PlaybackHub
+    let look: Look
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(title)
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(look.muted)
+                .lineLimit(1)
+                .padding(.bottom, 4)
+            if let items = hub.queue?.items, !items.isEmpty {
+                ForEach(items) { item in
+                    QueueRow(item: item, look: look) { hub.playQueued(item.index) }
+                }
+            } else {
+                Text(emptyText)
+                    .font(.system(size: 12))
+                    .foregroundStyle(look.muted)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private var title: String {
+        guard let q = hub.queue else { return "Up next" }
+        // Music doesn't share the shuffled order, only the playlist's own.
+        return q.shuffled ? "From \u{201C}\(q.playlist)\u{201D}, shuffled" : "Up next from \u{201C}\(q.playlist)\u{201D}"
+    }
+
+    private var emptyText: String {
+        if hub.nowPlaying?.source == .spotify { return "Spotify doesn't share its queue with other apps." }
+        if hub.queue != nil { return "That's the end of the playlist." }
+        return "Music isn't playing from a playlist, so there's nothing to list."
+    }
+}
+
+struct QueueRow: View {
+    let item: PlayQueue.Item
+    let look: Look
+    let action: () -> Void
+    @State private var hovering = false
+
+    var body: some View {
+        Button(action: action) {
+            VStack(alignment: .leading, spacing: 1) {
+                Text(item.title).font(.system(size: 12.5, weight: .medium)).foregroundStyle(look.text)
+                Text(item.artist).font(.system(size: 11)).foregroundStyle(look.muted)
+            }
+            .lineLimit(1)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.vertical, 4)
+            .padding(.horizontal, 8)
+            .background(RoundedRectangle(cornerRadius: 8, style: .continuous).fill(look.text.opacity(hovering ? 0.08 : 0)))
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .padding(.horizontal, -8)
+        .onHover { hovering = $0 }
+        .accessibilityLabel("\(item.title) by \(item.artist)")
+        .accessibilityHint("Plays this song")
+        .help("Play \(item.title)")
+    }
+}
+
 // MARK: - The player card
 
 struct PlayerCard: View {
@@ -545,6 +795,7 @@ struct PlayerCard: View {
     @ObservedObject var lyrics: LyricsController
     @ObservedObject var settings: AppSettings
     let events: PanelEvents
+    let visualizer: Visualizer
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     static let margin: CGFloat = 28
@@ -561,29 +812,38 @@ struct PlayerCard: View {
     private func card(_ look: Look) -> some View {
         let track = hub.nowPlaying
         let playing = track?.isPlaying ?? false
-        let width = settings.size.width
+        let width = CGFloat(settings.playerWidth)
         let inner = width - 36
+        let scale = min(1.12, max(0.88, width / 320))
         // "Slide the record back in": the cover stays, only the record goes home.
         let emptyWhilePaused = settings.pausedBehavior == .emptyPlayer && !playing
         let artwork = hub.artwork
         let spins = settings.spinRecord && !reduceMotion
 
-        return TimelineView(.animation(minimumInterval: spins ? 1.0 / 30 : 0.25, paused: !playing)) { timeline in
+        // The record turns in Core Animation, so this only moves the scrubber and the arm.
+        return TimelineView(.animation(minimumInterval: 0.5, paused: !playing)) { timeline in
             let position = track?.position(at: timeline.date) ?? 0
-            let angle = spins ? position * 200 : 0
-            VStack(alignment: .leading, spacing: 16) {
+            let spinning = spins && playing
+            VStack(alignment: .leading, spacing: 14) {
                 if settings.layout != .minimal {
-                    deck(inner: inner, angle: angle, playing: playing, progress: track?.progress(at: timeline.date) ?? 0,
+                    deck(inner: inner, spinning: spinning, playing: playing, progress: track?.progress(at: timeline.date) ?? 0,
                          artwork: artwork, hasTrack: track != nil && !emptyWhilePaused, look: look)
                         .frame(width: inner)
                         .allowsHitTesting(false)
                         .accessibilityHidden(true)
                 }
-                header(look: look, angle: angle, artwork: artwork)
+                header(look: look, spinning: spinning, artwork: artwork)
                 Scrubber(track: track, position: position, look: look) { hub.seek(to: $0) }
+                if track != nil {
+                    ControlsRow(hub: hub, look: look, controls: settings.controls, scale: scale,
+                                queueOpen: settings.showQueue, onQueue: { settings.showQueue.toggle() })
+                        .frame(maxWidth: .infinity)
+                }
                 if settings.lyricsEnabled {
-                    LyricsBlock(lyrics: lyrics, look: look, position: position, lines: settings.lyricsLines,
-                                fontSize: settings.lyricsFontSize, progress: track?.progress(at: timeline.date) ?? 0)
+                    LyricsBlock(lyrics: lyrics, look: look, track: track, fontSize: settings.lyricsFontSize)
+                }
+                if settings.showQueue, track != nil {
+                    QueueList(hub: hub, look: look)
                 }
             }
             .padding(18)
@@ -602,46 +862,47 @@ struct PlayerCard: View {
     }
 
     @ViewBuilder
-    private func deck(inner: CGFloat, angle: Double, playing: Bool, progress: Double, artwork: NSImage?,
+    private func deck(inner: CGFloat, spinning: Bool, playing: Bool, progress: Double, artwork: NSImage?,
                       hasTrack: Bool, look: Look) -> some View {
         switch settings.layout {
         case .sleeve:
-            SleeveDeck(side: inner / 1.42, angle: angle, playing: playing, hasTrack: hasTrack, artwork: artwork,
+            SleeveDeck(side: inner / 1.42, spinning: spinning && hasTrack, playing: playing, hasTrack: hasTrack, artwork: artwork,
                        look: look, reduceMotion: reduceMotion)
         case .turntable:
-            TurntableDeck(geo: DeckGeometry(diameter: inner / 1.30), angle: angle, playing: playing, progress: progress,
+            TurntableDeck(geo: DeckGeometry(diameter: inner / 1.30), spinning: spinning, playing: playing, progress: progress,
                           artwork: artwork, look: look, reduceMotion: reduceMotion)
         case .record:
-            RecordDisc(diameter: inner * 0.88, angle: angle, artwork: artwork, labelColor: look.accent)
+            RecordDisc(diameter: inner * 0.88, spinning: spinning, artwork: artwork, labelColor: look.accent)
                 .shadow(color: .black.opacity(0.4), radius: 12, y: 8)
         case .minimal:
             EmptyView()
         }
     }
 
-    private func header(look: Look, angle: Double, artwork: NSImage?) -> some View {
-        let track = hub.nowPlaying
+    private func header(look: Look, spinning: Bool, artwork: NSImage?) -> some View {
         return HStack(spacing: 12) {
             if settings.layout == .minimal {
-                RecordDisc(diameter: 46, angle: angle, artwork: artwork, labelColor: look.accent)
+                RecordDisc(diameter: 46, spinning: spinning, artwork: artwork, labelColor: look.accent)
                     .shadow(color: .black.opacity(0.35), radius: 4, y: 2)
                     .allowsHitTesting(false)
                     .accessibilityHidden(true)
             }
             VStack(alignment: .leading, spacing: 2) {
-                Text(track?.title ?? "Nothing playing")
-                    .font(.system(size: 15, weight: .semibold))
-                    .tracking(-0.2)
+                Text(hub.nowPlaying?.title ?? "Nothing playing")
+                    .font(.system(size: 16, weight: .semibold).width(.expanded))
+                    .tracking(-0.3)
                     .foregroundStyle(look.text)
                 Text(subtitle)
-                    .font(.system(size: 12.5, weight: .medium))
+                    .font(.system(size: 12.5, weight: .regular))
                     .foregroundStyle(look.muted)
             }
             .lineLimit(1)
             .allowsHitTesting(false)
             .accessibilityElement(children: .combine)
             Spacer(minLength: 8)
-            if track != nil { Transport(hub: hub, look: look) }
+            if settings.showVisualizer {
+                LevelBars(visualizer: visualizer, color: look.accent, height: 18)
+            }
             if settings.layout == .minimal { ShrinkButton(look: look) { events.onShrink() } }
         }
     }
@@ -662,21 +923,22 @@ struct MiniDiscView: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     static let diameter: CGFloat = 74
-    static let margin: CGFloat = 18
+    static let margin: CGFloat = PlayerCard.margin
+    /// Known up front, so the window can shrink to it at once.
+    static let windowSize = CGSize(width: diameter + 12 + margin * 2, height: diameter + 12 + margin * 2)
 
     var body: some View {
         LookReader(style: settings.look, palette: hub.palette) { look in
             let track = hub.nowPlaying
             let playing = track?.isPlaying ?? false
             let spins = settings.spinRecord && !reduceMotion
-            TimelineView(.animation(minimumInterval: spins ? 1.0 / 30 : 1, paused: !playing)) { timeline in
-                let position = track?.position(at: timeline.date) ?? 0
+            TimelineView(.animation(minimumInterval: 0.5, paused: !playing)) { timeline in
                 ZStack {
                     Circle().stroke(look.text.opacity(0.14), lineWidth: 3)
                     Circle().trim(from: 0, to: track?.progress(at: timeline.date) ?? 0)
                         .stroke(look.accent, style: StrokeStyle(lineWidth: 3, lineCap: .round))
                         .rotationEffect(.degrees(-90))
-                    RecordDisc(diameter: Self.diameter, angle: spins ? position * 200 : 0,
+                    RecordDisc(diameter: Self.diameter, spinning: spins && playing,
                                artwork: hub.artwork, labelColor: look.accent)
                 }
                 .frame(width: Self.diameter + 12, height: Self.diameter + 12)
@@ -704,11 +966,12 @@ struct PlayerRoot: View {
     let lyrics: LyricsController
     let settings: AppSettings
     let events: PanelEvents
+    let visualizer: Visualizer
 
     var body: some View {
         switch state.presentation {
         case .mini: MiniDiscView(hub: hub, settings: settings, events: events)
-        case .expanded, .hidden: PlayerCard(hub: hub, lyrics: lyrics, settings: settings, events: events)
+        case .expanded, .hidden: PlayerCard(hub: hub, lyrics: lyrics, settings: settings, events: events, visualizer: visualizer)
         }
     }
 }
@@ -726,6 +989,7 @@ struct MenuBarPlayerView: View {
     @ObservedObject var hub: PlaybackHub
     @ObservedObject var lyrics: LyricsController
     @ObservedObject var settings: AppSettings
+    @ObservedObject var stats: StatsStore
     let actions: MenuBarActions
 
     var body: some View {
@@ -748,7 +1012,7 @@ struct MenuBarPlayerView: View {
                         .clipShape(RoundedRectangle(cornerRadius: Radius.thumb, style: .continuous))
                         .accessibilityHidden(true)
                         VStack(alignment: .leading, spacing: 2) {
-                            Text(track?.title ?? "Nothing playing").font(.system(size: 14, weight: .semibold))
+                            Text(track?.title ?? "Nothing playing").font(.system(size: 14, weight: .semibold).width(.expanded))
                             Text(track?.artist ?? "Play something in Apple Music or Spotify")
                                 .font(.system(size: 12, weight: .medium)).foregroundStyle(look.muted)
                         }
@@ -759,13 +1023,15 @@ struct MenuBarPlayerView: View {
                     Scrubber(track: track, position: position, look: look) { hub.seek(to: $0) }
                     HStack {
                         Spacer()
-                        if track != nil { Transport(hub: hub, look: look, scale: 1.1, keyboard: true) }
+                        if track != nil { ControlsRow(hub: hub, look: look, controls: settings.controls, scale: 1.1, keyboard: true) }
                         Spacer()
                     }
                     if settings.lyricsEnabled, track != nil {
-                        LyricsBlock(lyrics: lyrics, look: look, position: position, lines: 2, fontSize: 13,
-                                    progress: track?.progress(at: timeline.date) ?? 0)
+                        LyricsBlock(lyrics: lyrics, look: look, track: track, fontSize: 13)
                     }
+                    Text("Today \(ListeningStats.format(stats.stats.today())), \(stats.stats.streak())-day streak")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(look.muted)
                     Divider()
                     HStack(spacing: 14) {
                         footer(actions.playerVisible() ? "Hide player" : "Show player", "rectangle.on.rectangle", actions.togglePlayer)
@@ -840,16 +1106,16 @@ struct FullScreenPlayerView: View {
         let track = hub.nowPlaying
         let playing = track?.isPlaying ?? false
         let spins = settings.spinRecord && !reduceMotion
-        return TimelineView(.animation(minimumInterval: spins ? 1.0 / 30 : 0.25, paused: !playing)) { timeline in
+        return TimelineView(.animation(minimumInterval: 0.25, paused: !playing)) { timeline in
             let position = track?.position(at: timeline.date) ?? 0
             HStack(alignment: .center, spacing: width * 0.06) {
-                SleeveDeck(side: side, angle: spins ? position * 200 : 0, playing: playing, hasTrack: track != nil,
+                SleeveDeck(side: side, spinning: spins && playing, playing: playing, hasTrack: track != nil,
                            artwork: hub.artwork, look: look, reduceMotion: reduceMotion)
                     .accessibilityHidden(true)
                 VStack(alignment: .leading, spacing: 24) {
                     VStack(alignment: .leading, spacing: 6) {
                         Text(track?.title ?? "Nothing playing")
-                            .font(.system(size: 40, weight: .bold)).tracking(-0.8)
+                            .font(.system(size: 40, weight: .bold).width(.expanded)).tracking(-1)
                             .foregroundStyle(look.text)
                         Text(track?.artist ?? "Play something in Apple Music or Spotify")
                             .font(.system(size: 22, weight: .semibold))
@@ -857,11 +1123,10 @@ struct FullScreenPlayerView: View {
                     }
                     .lineLimit(2)
                     Scrubber(track: track, position: position, look: look) { hub.seek(to: $0) }
-                    if track != nil { Transport(hub: hub, look: look, scale: 1.5, keyboard: true) }
+                    if track != nil { ControlsRow(hub: hub, look: look, controls: settings.controls, scale: 1.5, keyboard: true) }
                     if settings.lyricsEnabled {
-                        LyricsBlock(lyrics: lyrics, look: look, position: position, lines: 4,
-                                    fontSize: settings.lyricsFontSize, large: true,
-                                    progress: track?.progress(at: timeline.date) ?? 0)
+                        LyricsBlock(lyrics: lyrics, look: look, track: track,
+                                    fontSize: settings.lyricsFontSize, large: true)
                     }
                 }
                 .frame(maxWidth: 560, alignment: .leading)
@@ -875,6 +1140,8 @@ struct FullScreenPlayerView: View {
 
 struct SettingsView: View {
     @ObservedObject var settings: AppSettings
+    @ObservedObject var stats: StatsStore
+    @State private var openAtLogin = LoginItem.isEnabled
 
     var body: some View {
         TabView {
@@ -888,6 +1155,7 @@ struct SettingsView: View {
                 }
                 .pickerStyle(.radioGroup)
                 if settings.look == .glass {
+                    ScreenCaptureRow()
                     Slider(value: $settings.glassClarity, in: 0...1) {
                         Text("Transparency")
                     } minimumValueLabel: {
@@ -903,10 +1171,20 @@ struct SettingsView: View {
                         Text("Album").font(.caption)
                     }
                 }
-                Picker("Size", selection: $settings.size) {
-                    ForEach(PlayerSize.allCases) { Text($0.label).tag($0) }
+                Slider(value: $settings.playerWidth, in: PlayerWidth.range) {
+                    Text("Size")
+                } minimumValueLabel: {
+                    Text("Small").font(.caption)
+                } maximumValueLabel: {
+                    Text("Large").font(.caption)
                 }
-                .pickerStyle(.segmented)
+                Section("Controls on the player") {
+                    ForEach(PlayerControl.allCases) { control in
+                        Toggle(control.label, isOn: Binding(get: { settings.controls.contains(control) },
+                                                            set: { settings.setControl(control, $0) }))
+                    }
+                }
+                Toggle("Live visualizer", isOn: $settings.showVisualizer)
                 Toggle("Spin the record", isOn: $settings.spinRecord)
                 Text("The record stays still when Reduce Motion is on in System Settings. Liquid Glass becomes solid when Reduce Transparency is on.")
                     .font(.footnote).foregroundStyle(.secondary)
@@ -916,6 +1194,8 @@ struct SettingsView: View {
 
             Form {
                 Toggle("Show the player", isOn: $settings.showPlayer)
+                Toggle("Open at login", isOn: Binding(get: { openAtLogin }, set: { LoginItem.set($0); openAtLogin = LoginItem.isEnabled }))
+                AccessibilityRow()
                 Toggle("Shrink to a mini disc when I'm not using it", isOn: $settings.autoShrink)
                 Picker("After", selection: $settings.autoShrinkAfter) {
                     Text("30 seconds").tag(30.0)
@@ -941,20 +1221,29 @@ struct SettingsView: View {
 
             Form {
                 Toggle("Show lyrics", isOn: $settings.lyricsEnabled)
-                Picker("Lines", selection: $settings.lyricsLines) {
-                    Text("1").tag(1)
-                    Text("2").tag(2)
-                    Text("3").tag(3)
-                }
-                .pickerStyle(.segmented)
-                .disabled(!settings.lyricsEnabled)
                 Slider(value: $settings.lyricsFontSize, in: 12...22, step: 1) { Text("Text size") }
                     .disabled(!settings.lyricsEnabled)
-                Text("Lyrics come from LRCLIB, a free community database. Discette sends only the song title, artist, album and length. Fix timing from the right-click menu.")
+                Slider(value: $settings.lyricsDelay, in: -3...3, step: 0.1) {
+                    Text("Timing")
+                } minimumValueLabel: {
+                    Text("Later").font(.caption)
+                } maximumValueLabel: {
+                    Text("Earlier").font(.caption)
+                }
+                .disabled(!settings.lyricsEnabled)
+                HStack {
+                    Text(timingText).foregroundStyle(.secondary).monospacedDigit()
+                    Spacer()
+                    Button("Reset") { settings.lyricsDelay = 0 }.disabled(settings.lyricsDelay == 0)
+                }
+                Text("Lyrics come from LRCLIB, a free community database. Discette sends only the song title, artist, album and length. Timing here applies to every song; fix a single song from the right-click menu.")
                     .font(.footnote).foregroundStyle(.secondary)
             }
             .formStyle(.grouped)
             .tabItem { Label("Lyrics", systemImage: "text.quote") }
+
+            StatsView(stats: stats)
+                .tabItem { Label("Stats", systemImage: "chart.bar") }
 
             Form {
                 Toggle("Show the song title next to the icon", isOn: $settings.menuBarShowsTitle)
@@ -968,6 +1257,118 @@ struct SettingsView: View {
             .formStyle(.grouped)
             .tabItem { Label("Menu bar", systemImage: "menubar.rectangle") }
         }
-        .frame(width: 500, height: 440)
+        .frame(width: 520, height: 520)
+    }
+}
+
+extension SettingsView {
+    var timingText: String {
+        let v = (settings.lyricsDelay * 10).rounded() / 10
+        if v == 0 { return "In time with the song" }
+        return String(format: v > 0 ? "%.1f s earlier" : "%.1f s later", abs(v))
+    }
+}
+
+// MARK: - Settings pieces
+
+/// Liquid Glass picks black or white text from what's behind it, which needs Screen Recording.
+struct ScreenCaptureRow: View {
+    var body: some View {
+        TimelineView(.periodic(from: .now, by: 2)) { _ in
+            if !BackdropSampler.isAllowed {
+                HStack {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Match text to the background")
+                        Text("Allow Discette in Privacy & Security, Screen & System Audio Recording, so glass text turns black on light backgrounds and white on dark ones. Discette looks only at a tiny thumbnail behind the player and keeps nothing.")
+                            .font(.footnote).foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Button("Allow…") {
+                        BackdropSampler.requestAccess()
+                        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture") {
+                            NSWorkspace.shared.open(url)
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Shows whether full-screen detection can work, with a way to fix it.
+struct AccessibilityRow: View {
+    var body: some View {
+        TimelineView(.periodic(from: .now, by: 2)) { _ in
+            let granted = AccessibilityAccess.isGranted
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(granted ? "Full-screen detection is on" : "Full-screen detection needs permission")
+                    Text(granted ? "Discette can tell when another app is full screen."
+                                 : "Allow Discette in Privacy & Security, Accessibility.")
+                        .font(.footnote).foregroundStyle(.secondary)
+                }
+                Spacer()
+                if !granted {
+                    Button("Allow…") {
+                        AccessibilityAccess.prompt()
+                        AccessibilityAccess.openSettings()
+                    }
+                }
+            }
+        }
+    }
+}
+
+struct StatsView: View {
+    @ObservedObject var stats: StatsStore
+    @State private var confirmReset = false
+
+    var body: some View {
+        let s = stats.stats
+        let streak = s.streak()
+        Form {
+            Section {
+                HStack(spacing: 0) {
+                    figure("Today", ListeningStats.format(s.today()))
+                    figure("This week", ListeningStats.format(s.week()))
+                    figure("Streak", streak == 1 ? "1 day" : "\(streak) days")
+                }
+                .padding(.vertical, 6)
+            }
+            Section("Top artists") {
+                let top = s.topArtists(5)
+                if top.isEmpty {
+                    Text("Play some music and your most-played artists show up here.")
+                        .foregroundStyle(.secondary)
+                }
+                ForEach(Array(top.enumerated()), id: \.offset) { index, artist in
+                    HStack {
+                        Text("\(index + 1)").monospacedDigit().foregroundStyle(.secondary).frame(width: 18, alignment: .leading)
+                        Text(artist.name).lineLimit(1)
+                        Spacer()
+                        Text(ListeningStats.format(artist.seconds)).monospacedDigit().foregroundStyle(.secondary)
+                    }
+                    .accessibilityElement(children: .combine)
+                }
+            }
+            Section {
+                Text("Counted while music plays. Kept on this Mac only.")
+                    .font(.footnote).foregroundStyle(.secondary)
+                Button("Reset Stats…", role: .destructive) { confirmReset = true }
+            }
+        }
+        .formStyle(.grouped)
+        .confirmationDialog("Reset all listening stats?", isPresented: $confirmReset) {
+            Button("Reset", role: .destructive) { stats.reset() }
+        }
+    }
+
+    private func figure(_ title: String, _ value: String) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(value).font(.system(size: 22, weight: .semibold).width(.expanded)).monospacedDigit()
+            Text(title).font(.caption).foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .accessibilityElement(children: .combine)
     }
 }

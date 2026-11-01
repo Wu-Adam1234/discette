@@ -20,12 +20,18 @@ public struct NowPlaying: Equatable, Sendable {
     public var positionDate: Date
     public var isPlaying: Bool
     public var shareURL: URL?
+    /// nil = this player doesn't report it (so the control is shown as unavailable).
+    public var shuffle: Bool?
+    public var repeatMode: RepeatMode?
+    public var favorite: Bool?
 
     public init(source: PlayerSource, trackID: String, title: String, artist: String, album: String,
-                duration: Double, position: Double, positionDate: Date, isPlaying: Bool, shareURL: URL? = nil) {
+                duration: Double, position: Double, positionDate: Date, isPlaying: Bool, shareURL: URL? = nil,
+                shuffle: Bool? = nil, repeatMode: RepeatMode? = nil, favorite: Bool? = nil) {
         self.source = source; self.trackID = trackID; self.title = title; self.artist = artist
         self.album = album; self.duration = duration; self.position = position
         self.positionDate = positionDate; self.isPlaying = isPlaying; self.shareURL = shareURL
+        self.shuffle = shuffle; self.repeatMode = repeatMode; self.favorite = favorite
     }
 
     /// Position extrapolated to `date`, so animation and lyrics stay smooth between polls.
@@ -39,6 +45,52 @@ public struct NowPlaying: Equatable, Sendable {
     public func progress(at date: Date) -> Double {
         guard duration > 0 else { return 0 }
         return max(0, min(1, position(at: date) / duration))
+    }
+
+    /// Keeps the previous snapshot's clock while a new reading agrees with it, so polling
+    /// latency never makes the position (and the lyrics) jitter. Seeks, pauses and new songs
+    /// differ by more than `tolerance` and come through as read.
+    public func keepingTiming(of old: NowPlaying?, tolerance: Double = 0.75) -> NowPlaying {
+        guard let old, old.trackID == trackID, old.isPlaying, isPlaying,
+              abs(old.position(at: positionDate) - position) < tolerance else { return self }
+        var out = self
+        out.position = old.position
+        out.positionDate = old.positionDate
+        return out
+    }
+}
+
+// MARK: - Queue
+
+/// What plays next, as far as the player shares it. Apple Music exposes only the playlist it
+/// is playing from, not Up Next or the shuffled order.
+public struct PlayQueue: Equatable, Sendable {
+    public struct Item: Equatable, Sendable, Identifiable {
+        public var index: Int        // position in the playlist, for "play this one"
+        public var title: String
+        public var artist: String
+        public var id: Int { index }
+        public init(index: Int, title: String, artist: String) { self.index = index; self.title = title; self.artist = artist }
+    }
+    public var playlist: String
+    public var shuffled: Bool
+    public var items: [Item]
+    public init(playlist: String, shuffled: Bool, items: [Item]) {
+        self.playlist = playlist; self.shuffled = shuffled; self.items = items
+    }
+}
+
+// MARK: - Backdrop
+
+public enum Backdrop {
+    /// Black text reads better than white above relative luminance ~0.18 (where the two
+    /// contrast ratios meet). A band around it stops flicker as things move behind the player.
+    public static func prefersDarkText(luminance: Double, current: Bool?) -> Bool {
+        switch current {
+        case true?: return luminance > 0.13
+        case false?: return luminance > 0.23
+        case nil: return luminance > 0.18
+        }
     }
 }
 
@@ -97,6 +149,58 @@ public enum LyricsSync {
             if lines[mid].time <= time { answer = mid; lo = mid + 1 } else { hi = mid - 1 }
         }
         return answer
+    }
+
+    /// 0...1 through line `index`, for highlighting it as it is sung. A line lasts until the
+    /// next one starts (a little less, as singers finish early), and at most `maxDuration`.
+    public static func lineProgress(in lines: [LyricLine], index: Int, at time: Double, maxDuration: Double = 6) -> Double {
+        guard lines.indices.contains(index) else { return 0 }
+        return max(0, min(1, (time - lines[index].time) / lineLength(in: lines, index: index, maxDuration: maxDuration)))
+    }
+
+    /// How long line `index` takes to sing, as `lineProgress` counts it.
+    public static func lineLength(in lines: [LyricLine], index: Int, maxDuration: Double = 6) -> Double {
+        let start = lines[index].time
+        let gap = index + 1 < lines.count ? (lines[index + 1].time - start) * 0.9 : maxDuration
+        return max(0.3, min(maxDuration, gap))
+    }
+
+    /// The song times (line times, as in the LRC) from `start` to `end` at which `revealed`
+    /// shows one more word or character: the only moments the lyrics need redrawing.
+    public static func revealTimes(in lines: [LyricLine], from start: Double, to end: Double) -> [Double] {
+        var out: [Double] = []
+        for (i, line) in lines.enumerated() where line.time <= end {
+            let length = lineLength(in: lines, index: i)
+            guard line.time + length >= start else { continue }
+            let steps = max(1, revealSteps(line.text))
+            for k in 0..<steps {
+                let t = line.time + length * Double(k) / Double(steps)
+                if t >= start, t <= end { out.append(t) }
+            }
+        }
+        return out
+    }
+
+    /// How many pieces `revealed` shows a line in: words, or characters for lines without spaces.
+    public static func revealSteps(_ text: String) -> Int {
+        let words = text.split(separator: " ", omittingEmptySubsequences: true).count
+        return words >= 3 ? words : text.count
+    }
+
+    /// The part of a line sung so far, so lyrics appear as the song says them. Word by word,
+    /// or character by character for lines without spaces (Japanese, Chinese, Korean...).
+    /// The first word shows as soon as the line starts.
+    public static func revealed(_ text: String, progress: Double) -> String {
+        let p = max(0, min(1, progress))
+        let words = text.split(separator: " ", omittingEmptySubsequences: true)
+        if words.count >= 3 {
+            let k = max(1, min(words.count, Int((Double(words.count) * p).rounded(.up))))
+            return words.prefix(k).joined(separator: " ")
+        }
+        let chars = Array(text)
+        guard !chars.isEmpty else { return text }
+        let k = max(1, min(chars.count, Int((Double(chars.count) * p).rounded(.up))))
+        return String(chars.prefix(k))
     }
 }
 

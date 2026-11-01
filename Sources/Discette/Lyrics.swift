@@ -131,6 +131,8 @@ final class LyricsController: ObservableObject {
     @Published private(set) var state: State = .waiting
     /// Seconds added to the song position for this track (positive = lyrics earlier).
     @Published private(set) var offset: Double = 0
+    /// The "Lyrics timing" setting, added to every song (positive = lyrics earlier).
+    var globalOffset: Double = 0
 
     private let provider: LyricsProvider
     private let store = LyricsStore()
@@ -187,13 +189,22 @@ final class LyricsController: ObservableObject {
     }
 
     private static func fetchWithOneRetry(_ provider: LyricsProvider, _ t: NowPlaying) async throws -> Lyrics? {
-        do {
-            return try await provider.fetch(title: t.title, artist: t.artist, album: t.album, duration: t.duration)
-        } catch LyricsError.rateLimited(let wait) {
-            let jitter = Double.random(in: 0...0.3)
-            try await Task.sleep(for: .seconds(min(wait, 30) * (1 + jitter)))
-            return try await provider.fetch(title: t.title, artist: t.artist, album: t.album, duration: t.duration)
+        func fetch(_ title: String) async throws -> Lyrics? {
+            do {
+                return try await provider.fetch(title: title, artist: t.artist, album: t.album, duration: t.duration)
+            } catch LyricsError.rateLimited(let wait) {
+                let jitter = Double.random(in: 0...0.3)
+                try await Task.sleep(for: .seconds(min(wait, 30) * (1 + jitter)))
+                return try await provider.fetch(title: title, artist: t.artist, album: t.album, duration: t.duration)
+            }
         }
+        let found = try await fetch(t.title)
+        if case .synced? = found { return found }
+        // "Song (2011 Remaster)" is usually listed as "Song": look again for synced lyrics.
+        let clean = LyricsQuery.cleanTitle(t.title)
+        guard clean != t.title, let better = try? await fetch(clean) else { return found }
+        if case .synced = better { return better }
+        return found ?? better
     }
 
     private func reset(to newState: State) {
@@ -219,7 +230,20 @@ final class LyricsController: ObservableObject {
     /// Index of the current line at a song position, with this track's offset applied.
     func currentIndex(at position: Double) -> Int? {
         guard let lines = syncedLines else { return nil }
-        return LyricsSync.currentIndex(in: lines, at: position + offset)
+        return LyricsSync.currentIndex(in: lines, at: position + offset + globalOffset)
+    }
+
+    /// Song positions in the next `window` seconds at which the shown lyric changes.
+    func changePositions(from position: Double, window: Double = 30) -> [Double] {
+        guard let lines = syncedLines else { return [] }
+        let shift = offset + globalOffset
+        return LyricsSync.revealTimes(in: lines, from: position + shift, to: position + shift + window).map { $0 - shift }
+    }
+
+    /// 0...1 through the current line, for highlighting it as it is sung.
+    func lineProgress(at position: Double) -> Double {
+        guard let lines = syncedLines, let i = currentIndex(at: position) else { return 0 }
+        return LyricsSync.lineProgress(in: lines, index: i, at: position + offset + globalOffset)
     }
 
     func currentLine(at position: Double) -> String? {

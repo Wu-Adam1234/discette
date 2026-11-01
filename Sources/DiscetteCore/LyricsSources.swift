@@ -40,6 +40,28 @@ public struct LocalLyricsProvider: LyricsProvider {
     }
 }
 
+public enum LyricsQuery {
+    private static let noise = ["remaster", "version", "edit", "mix", "feat", "live", "mono", "stereo",
+                                "deluxe", "bonus", "explicit", "anniversary", "acoustic", "from "]
+
+    /// The song title without store extras that lyrics databases don't use:
+    /// "Song (2011 Remaster)", "Song - Remastered 2009", "Song [feat. X]" -> "Song".
+    public static func cleanTitle(_ title: String) -> String {
+        var t = title
+        while t.hasSuffix(")") || t.hasSuffix("]"), let open = t.lastIndex(where: { $0 == "(" || $0 == "[" }) {
+            let inner = t[t.index(after: open)..<t.index(before: t.endIndex)].lowercased()
+            guard noise.contains(where: inner.contains) else { break }
+            t = String(t[..<open]).trimmingCharacters(in: .whitespaces)
+        }
+        if let dash = t.range(of: " - ", options: .backwards),
+           noise.contains(where: t[dash.upperBound...].lowercased().contains) {
+            t = String(t[..<dash.lowerBound])
+        }
+        let out = t.trimmingCharacters(in: .whitespaces)
+        return out.isEmpty ? title : out
+    }
+}
+
 /// Tries each source in order. Synced lyrics win at once; plain lyrics are kept in case nothing
 /// better turns up. If nothing was found and any source failed (rather than saying "not found"),
 /// the error is passed on, so the song is retried later instead of remembered as "no lyrics".

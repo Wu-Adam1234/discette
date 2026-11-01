@@ -1,0 +1,24 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  macos:
+    name: macOS app
+    # Liquid Glass needs the macOS 26 SDK to compile; the app itself runs on macOS 15 and later.
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+      - name: Swift version
+        run: swift --version
+      - name: Unit tests
+        run: swift test
+      - name: Build the app bundle
+        run: DISCETTE_BUILD_DIR="$RUNNER_TEMP/discette" scripts/bundle.sh release zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Discette-macOS
+          path: dist/Discette-*.zip

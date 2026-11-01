@@ -31,17 +31,10 @@ enum PlayerLook: String, CaseIterable, Identifiable {
     }
 }
 
-enum PlayerSize: String, CaseIterable, Identifiable {
-    case small, medium, large
-    var id: String { rawValue }
-    var label: String { rawValue.capitalized }
-    var width: CGFloat {
-        switch self {
-        case .small: 290
-        case .medium: 340
-        case .large: 410
-        }
-    }
+/// Card width in points, set with the Size slider.
+enum PlayerWidth {
+    static let range: ClosedRange<Double> = 220...440
+    static let standard: Double = 340
 }
 
 enum PausedBehavior: String, CaseIterable, Identifiable {
@@ -68,6 +61,22 @@ enum FullScreenBehavior: String, CaseIterable, Identifiable {
     }
 }
 
+enum PlayerControl: String, CaseIterable, Identifiable {
+    case shuffle, previous, playPause, next, repeatMode, favorite, queue
+    var id: String { rawValue }
+    var label: String {
+        switch self {
+        case .shuffle: "Shuffle"
+        case .previous: "Previous track"
+        case .playPause: "Play and pause"
+        case .next: "Next track"
+        case .repeatMode: "Repeat"
+        case .favorite: "Favourite"
+        case .queue: "Up next"
+        }
+    }
+}
+
 enum PinCorner: String, CaseIterable, Identifiable {
     case free, topLeft, topRight, bottomLeft, bottomRight
     var id: String { rawValue }
@@ -89,12 +98,11 @@ final class AppSettings: ObservableObject {
     @Published var showPlayer: Bool { didSet { d.set(showPlayer, forKey: "showPlayer") } }
     @Published var layout: PlayerLayout { didSet { d.set(layout.rawValue, forKey: "layout") } }
     @Published var look: PlayerLook { didSet { d.set(look.rawValue, forKey: "look") } }
-    @Published var size: PlayerSize { didSet { d.set(size.rawValue, forKey: "size") } }
+    @Published var playerWidth: Double { didSet { d.set(playerWidth, forKey: "playerWidth") } }
     @Published var glassClarity: Double { didSet { d.set(glassClarity, forKey: "glassClarity") } }
     @Published var glassTint: Double { didSet { d.set(glassTint, forKey: "glassTint") } }
     @Published var pausedBehavior: PausedBehavior { didSet { d.set(pausedBehavior.rawValue, forKey: "pausedBehavior") } }
     @Published var lyricsEnabled: Bool { didSet { d.set(lyricsEnabled, forKey: "lyricsEnabled") } }
-    @Published var lyricsLines: Int { didSet { d.set(lyricsLines, forKey: "lyricsLines") } }
     @Published var lyricsFontSize: Double { didSet { d.set(lyricsFontSize, forKey: "lyricsFontSize") } }
     @Published var spinRecord: Bool { didSet { d.set(spinRecord, forKey: "spinRecord") } }
     @Published var autoShrink: Bool { didSet { d.set(autoShrink, forKey: "autoShrink") } }
@@ -103,6 +111,18 @@ final class AppSettings: ObservableObject {
     @Published var pinCorner: PinCorner { didSet { d.set(pinCorner.rawValue, forKey: "pinCorner") } }
     @Published var menuBarShowsTitle: Bool { didSet { d.set(menuBarShowsTitle, forKey: "menuBarShowsTitle") } }
     @Published var titleFormat: String { didSet { d.set(titleFormat, forKey: "titleFormat") } }
+    @Published var controls: [PlayerControl] { didSet { d.set(controls.map(\.rawValue).joined(separator: ","), forKey: "controls") } }
+    @Published var showVisualizer: Bool { didSet { d.set(showVisualizer, forKey: "showVisualizer") } }
+    /// Seconds added to every song's lyrics (positive = earlier).
+    @Published var lyricsDelay: Double { didSet { d.set(lyricsDelay, forKey: "lyricsDelay") } }
+    @Published var showQueue: Bool { didSet { d.set(showQueue, forKey: "showQueue") } }
+
+    /// Turns a control on or off, keeping the fixed order of `PlayerControl.allCases`.
+    func setControl(_ control: PlayerControl, _ on: Bool) {
+        var set = Set(controls)
+        if on { set.insert(control) } else { set.remove(control) }
+        controls = PlayerControl.allCases.filter(set.contains)
+    }
 
     init() {
         let d = UserDefaults.standard
@@ -113,20 +133,29 @@ final class AppSettings: ObservableObject {
         showPlayer = bool("showPlayer", true)
         layout = pick("layout", PlayerLayout.sleeve)
         look = pick("look", PlayerLook.album)
-        size = pick("size", PlayerSize.medium)
+        // Older versions saved a small/medium/large choice.
+        let oldSize = ["small": 290.0, "medium": 340, "large": 410][d.string(forKey: "size") ?? ""]
+        let width = d.object(forKey: "playerWidth") as? Double ?? oldSize ?? PlayerWidth.standard
+        playerWidth = min(PlayerWidth.range.upperBound, max(PlayerWidth.range.lowerBound, width))
         glassClarity = d.object(forKey: "glassClarity") as? Double ?? 0.6
         glassTint = d.object(forKey: "glassTint") as? Double ?? 0.25
         pausedBehavior = pick("pausedBehavior", PausedBehavior.keep)
         lyricsEnabled = bool("lyricsEnabled", true)
-        lyricsLines = min(3, max(1, d.object(forKey: "lyricsLines") as? Int ?? 2))
         lyricsFontSize = d.object(forKey: "lyricsFontSize") as? Double ?? 15
         spinRecord = bool("spinRecord", true)
-        autoShrink = bool("autoShrink", true)
+        // Off unless asked for: shrinking on its own felt random.
+        autoShrink = bool("autoShrink", false)
         autoShrinkAfter = d.object(forKey: "autoShrinkAfter") as? Double ?? 60
         fullScreenBehavior = pick("fullScreenBehavior", FullScreenBehavior.shrink)
         pinCorner = pick("pinCorner", PinCorner.free)
         menuBarShowsTitle = bool("menuBarShowsTitle", false)
         titleFormat = d.string(forKey: "titleFormat") ?? "{title} by {artist}"
+        let savedControls = (d.string(forKey: "controls") ?? "previous,playPause,next,queue")
+            .split(separator: ",").compactMap { PlayerControl(rawValue: String($0)) }
+        controls = PlayerControl.allCases.filter(Set(savedControls).contains)
+        showVisualizer = bool("showVisualizer", true)
+        lyricsDelay = d.object(forKey: "lyricsDelay") as? Double ?? 0
+        showQueue = bool("showQueue", false)
     }
 }
 
@@ -163,6 +192,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var panel: FloatingPanel!
     private var menuBar: MenuBarController!
     private var watcher: FullScreenWatcher!
+    private var stats: StatsStore!
+    private var visualizer: Visualizer!
+    private let backdrop = BackdropSampler()
     private let fullScreen = FullScreenPlayerController()
     private var idleTimer: Timer?
     private var settingsWindow: NSWindow?
@@ -174,6 +206,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         lyrics = LyricsController()
         state = PlayerState()
         events = PanelEvents()
+        stats = StatsStore(hub: hub)
+        visualizer = Visualizer()
 
         events.menu = { [weak self] in self?.buildMenu() }
         events.canDrag = { [weak self] in self?.settings.pinCorner == .free }
@@ -186,10 +220,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         events.onShrink = { [weak self] in self?.shrink() }
 
         panel = FloatingPanel(name: "player", root: AnyView(
-            PlayerRoot(state: state, hub: hub, lyrics: lyrics, settings: settings, events: events)))
+            PlayerRoot(state: state, hub: hub, lyrics: lyrics, settings: settings, events: events, visualizer: visualizer)))
 
         menuBar = MenuBarController(root: AnyView(MenuBarPlayerView(
-            hub: hub, lyrics: lyrics, settings: settings,
+            hub: hub, lyrics: lyrics, settings: settings, stats: stats,
             actions: MenuBarActions(
                 playerVisible: { [weak self] in self?.settings.showPlayer ?? false },
                 togglePlayer: { [weak self] in self?.settings.showPlayer.toggle() },
@@ -224,8 +258,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         hub.$nowPlaying.sink(receiveValue: later).store(in: &bag)
         settings.objectWillChange.sink(receiveValue: later).store(in: &bag)
         lyrics.$state.removeDuplicates().sink(receiveValue: later).store(in: &bag)
+        hub.$queue.sink(receiveValue: later).store(in: &bag)
 
+        // Liquid Glass: black or white text and buttons, whichever reads on what's behind.
+        backdrop.onChange = { [weak self] light in
+            self?.panel.appearance = light.map { NSAppearance(named: $0 ? .aqua : .darkAqua)! }
+        }
+
+        firstRunSetup()
         sync()
+    }
+
+    /// Once: ask for Accessibility (needed to notice full-screen apps) and turn on Open at login
+    /// when running from /Applications.
+    private func firstRunSetup() {
+        let d = UserDefaults.standard
+        if !d.bool(forKey: "askedAccessibility"), settings.fullScreenBehavior != .keep, !AccessibilityAccess.isGranted {
+            d.set(true, forKey: "askedAccessibility")
+            AccessibilityAccess.prompt()
+        }
+        if !d.bool(forKey: "askedScreenCapture"), settings.look == .glass, !BackdropSampler.isAllowed {
+            d.set(true, forKey: "askedScreenCapture")
+            BackdropSampler.requestAccess()
+        }
+        if !d.bool(forKey: "loginItemSetUp"), Bundle.main.bundlePath.hasPrefix("/Applications/") {
+            d.set(true, forKey: "loginItemSetUp")
+            LoginItem.set(true)
+        }
     }
 
     // MARK: Presentation
@@ -246,6 +305,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func sync() {
         lyrics.update(for: hub.nowPlaying, enabled: settings.lyricsEnabled)
+        lyrics.globalOffset = settings.lyricsDelay
 
         if settings.menuBarShowsTitle, let track = hub.nowPlaying {
             let text = TitleFormat.render(settings.titleFormat, title: track.title, artist: track.artist, album: track.album)
@@ -256,6 +316,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         let next = presentation()
         if state.presentation != next { state.presentation = next }
+        hub.wantsQueue = settings.showQueue && next == .expanded
+        // The visualizer listens only while its bars can be seen.
+        visualizer.update(bundleID: hub.activeBundleID, playing: hub.nowPlaying?.isPlaying ?? false,
+                          enabled: settings.showVisualizer && next == .expanded)
+        backdrop.update(window: panel, active: next != .hidden && settings.look == .glass)
         if next == .hidden {
             if panel.isVisible { panel.orderOut(nil) }
             lastLayoutKey = ""
@@ -269,23 +334,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Let SwiftUI apply the change, then size the window to it.
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
-            self.panel.place(size: self.panel.idealSize(), pin: self.settings.pinCorner)
+            // The mini disc's size is fixed; the card is measured. SwiftUI can still be showing the
+            // previous view on this pass, which left a card-sized window around the mini disc (so
+            // it sat in that window's corner, blocking clicks), so measure again once it settles.
+            let size = next == .mini ? MiniDiscView.windowSize : self.panel.idealSize()
+            self.panel.place(size: size, pin: self.settings.pinCorner)
             if !self.panel.isVisible { self.panel.orderFrontRegardless() }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
+                guard let self, self.state.presentation == next, next == .expanded else { return }
+                self.panel.place(size: self.panel.idealSize(), pin: self.settings.pinCorner)
+            }
         }
     }
 
     private var lastLayoutKey = ""
 
     private func layoutKey(_ presentation: Presentation) -> String {
-        let lyricsShape: String
-        switch lyrics.state {
-        case .loaded(.synced), .loaded(.plain): lyricsShape = "full"
-        case .waiting, .off: lyricsShape = "none"
-        default: lyricsShape = "status"
-        }
+        // Lyrics are one line at a fixed height whatever they say; only on/off changes the size.
+        let lyricsShape = (lyrics.state == .waiting || lyrics.state == .off) ? "none" : "line"
         return [
-            "\(presentation)", settings.layout.rawValue, settings.size.rawValue, settings.pinCorner.rawValue,
-            "\(settings.lyricsEnabled)", "\(settings.lyricsLines)", "\(settings.lyricsFontSize)", lyricsShape,
+            "\(presentation)", settings.layout.rawValue, "\(Int(settings.playerWidth))", settings.pinCorner.rawValue,
+            "\(settings.showQueue)", "\(hub.queue?.items.count ?? -1)", "\(hub.queue?.shuffled ?? false)", settings.controls.map(\.rawValue).joined(),
+            "\(settings.lyricsEnabled)", "\(settings.lyricsFontSize)", lyricsShape,
             "\(hub.nowPlaying == nil)", "\(hub.needsPermission == nil)",
         ].joined(separator: "|")
     }
@@ -346,6 +416,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             menu.add(ActionItem("Shrink to Mini Disc") { [weak self] in self?.shrink() })
         }
         menu.add(ActionItem("Full Screen Player") { [weak self] in self?.openFullScreen() })
+        menu.add(ActionItem("Show Up Next", checked: settings.showQueue) { [weak self] in
+            guard let self else { return }
+            self.settings.showQueue.toggle()
+        })
 
         menu.addSubmenu("Layout") { sub in
             for option in PlayerLayout.allCases {
@@ -366,6 +440,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             sub.add(ActionItem("Show Lyrics", checked: settings.lyricsEnabled) { [weak self] in self?.settings.lyricsEnabled.toggle() })
             if lyrics.syncedLines != nil {
                 sub.addItem(.separator())
+                sub.addLabel("This song")
                 sub.add(ActionItem("Show Lyrics Earlier (0.5 s)") { [weak self] in self?.lyrics.nudge(by: 0.5) })
                 sub.add(ActionItem("Show Lyrics Later (0.5 s)") { [weak self] in self?.lyrics.nudge(by: -0.5) })
                 sub.add(ActionItem("Reset Timing", enabled: lyrics.offset != 0) { [weak self] in
@@ -405,7 +480,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func openSettings() {
         if settingsWindow == nil {
-            let window = NSWindow(contentViewController: NSHostingController(rootView: SettingsView(settings: settings)))
+            let window = NSWindow(contentViewController: NSHostingController(rootView: SettingsView(settings: settings, stats: stats)))
             window.title = "Discette Settings"
             window.styleMask = [.titled, .closable]
             window.isReleasedWhenClosed = false

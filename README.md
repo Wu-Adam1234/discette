@@ -48,6 +48,9 @@ Settings.
   while without use (off by default). When another app goes full screen it can stay, shrink or hide.
 - **Stays where you put it.** Drag it anywhere, or pin it to any corner of the screen.
 - **Full-screen player** for when the music is the point.
+- **Notch player** (optional, off by default). On MacBooks with a notch, a small record and a
+  progress ring sit beside it; point at the notch and it drops open with the controls and lyrics.
+  Turn it on in Settings → Behaviour.
 - **Menu bar.** Just the Discette mark (the song title is optional). Click for a mini player,
   right-click for every option.
 - **No accounts.** Discette reads the Music and Spotify apps on your Mac. Nothing to log into.

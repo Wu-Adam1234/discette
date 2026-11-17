@@ -9,14 +9,33 @@ import SwiftUI
 // of the cover colours (Paper), or the system material (Liquid Glass). Every pair is checked
 // for contrast; Reduce Transparency turns glass into Graphite; Increase Contrast strengthens
 // hairlines and secondary text.
-// Shape: card 26pt continuous, sleeve 4pt. Controls: bare glyphs, one solid play/pause disc.
-// Motion: the record turns at 33 1/3 rpm and slides out of its sleeve while playing. Reduce
-// Motion stops both.
+// Shape: concentric. Card 24pt continuous with 16pt padding, so things inset in it get 24 - 16 = 8pt.
+// Controls: bare glyphs, one solid play/pause disc in the album accent (the only tinted control).
+// Edges: one soft rim and a two-layer shadow (tight contact + wide ambient), never a hard border.
+// Type: one family, two steps. Title semibold, everything else regular or medium in the muted colour.
+// Motion: hover and press are snappy and short (under 0.25 s); colour changes are smooth. The record
+// turns at 33 1/3 rpm and slides out of its sleeve while playing. Reduce Motion stops both.
 
 enum Radius {
-    static let card: CGFloat = 26
-    static let sleeve: CGFloat = 4
-    static let thumb: CGFloat = 6
+    static let card: CGFloat = 24
+    static let padding: CGFloat = 16
+    static let inset: CGFloat = card - padding
+    static let sleeve: CGFloat = inset
+    static let thumb: CGFloat = 8
+}
+
+enum Motion {
+    static let hover = Animation.snappy(duration: 0.2)
+    static let press = Animation.snappy(duration: 0.18)
+    static let colour = Animation.smooth(duration: 0.6)
+}
+
+extension View {
+    /// Two shadows read as a real object: a tight one where it touches, a soft one for lift.
+    func layeredShadow(_ strength: Double = 1, lift: CGFloat = 1) -> some View {
+        shadow(color: .black.opacity(0.22 * strength), radius: 1.5 * lift, y: 1 * lift)
+            .shadow(color: .black.opacity(0.26 * strength), radius: 14 * lift, y: 9 * lift)
+    }
 }
 
 extension RGB {
@@ -68,12 +87,13 @@ struct Look: Equatable {
             if reduceTransparency {
                 return make(.graphite, palette, reduceTransparency: true, increaseContrast: increaseContrast)
             }
+            // Text is black on a light backdrop, white on a dark one (see BackdropSampler). The
+            // play disc is solid album accent: glass vibrancy turned a `.primary` disc muddy grey.
             return Look(fill: nil, text: .primary, muted: .secondary, accent: palette.accent.color,
                         onAccent: palette.background.color,
                         hairline: .white.opacity(increaseContrast ? 0.45 : 0.16),
                         sleeveBlank: Color.primary.opacity(0.12),
-                        // Black on a light backdrop, white on a dark one (see BackdropSampler).
-                        primary: .primary, onPrimary: Color(nsColor: .windowBackgroundColor))
+                        primary: palette.accent.color, onPrimary: palette.background.color)
         }
     }
 }
@@ -99,16 +119,18 @@ struct CardSurface: ViewModifier {
                     .background(shape.fill(look.accent.opacity(look.glassTint * 0.3)))
             }
         }
-        .overlay(shape.strokeBorder(look.hairline, lineWidth: 1).allowsHitTesting(false))
         .overlay {
-            // Light catching the rim of the glass.
+            // One rim only. Glass: light catching the top edge and fading round the sides.
+            // Solid looks: a faint inner ring that separates the card from any desktop.
             if look.isGlass {
-                shape.strokeBorder(LinearGradient(colors: [.white.opacity(0.55), .white.opacity(0.04), .white.opacity(0.22)],
-                                                  startPoint: .topLeading, endPoint: .bottomTrailing), lineWidth: 1.2)
-                    .allowsHitTesting(false)
+                shape.strokeBorder(LinearGradient(colors: [.white.opacity(0.42), .white.opacity(0.05), .white.opacity(0.14)],
+                                                  startPoint: .top, endPoint: .bottom), lineWidth: 1)
+            } else {
+                shape.strokeBorder(look.hairline.opacity(0.7), lineWidth: 1)
             }
         }
-        .shadow(color: .black.opacity(0.32), radius: 22, y: 14)
+        // No compositingGroup here: it renders off screen, so Liquid Glass couldn't see the desktop.
+        .layeredShadow(1.15, lift: 1.5)
     }
 }
 
@@ -184,6 +206,13 @@ struct SpinningLabel: NSViewRepresentable {
             guard spinning != isSpinning else { return }
             isSpinning = spinning
             if spinning {
+                // Pick up from wherever the record is now, even part-way through a coast.
+                angle = (disc.presentation()?.value(forKeyPath: "transform.rotation.z") as? Double) ?? angle
+                CATransaction.begin()
+                CATransaction.setDisableActions(true)
+                disc.removeAnimation(forKey: "coast")
+                disc.setValue(angle, forKeyPath: "transform.rotation.z")
+                CATransaction.commit()
                 let turn = CABasicAnimation(keyPath: "transform.rotation.z")
                 turn.fromValue = angle
                 turn.toValue = angle - 2 * .pi   // negative is clockwise here
@@ -192,12 +221,23 @@ struct SpinningLabel: NSViewRepresentable {
                 turn.isRemovedOnCompletion = false
                 disc.add(turn, forKey: "spin")
             } else {
-                angle = (disc.presentation()?.value(forKeyPath: "transform.rotation.z") as? Double) ?? angle
+                // Coast to a stop like a platter losing power, instead of freezing mid-turn.
+                // At full speed it turns 2π per 1.8 s; an ease-out over 0.7 s covers about half that.
+                let current = (disc.presentation()?.value(forKeyPath: "transform.rotation.z") as? Double) ?? angle
+                let coast = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion ? 0 : 0.7
+                angle = current - (2 * .pi / 1.8) * coast / 2
                 CATransaction.begin()
                 CATransaction.setDisableActions(true)
                 disc.removeAnimation(forKey: "spin")
                 disc.setValue(angle, forKeyPath: "transform.rotation.z")
                 CATransaction.commit()
+                guard coast > 0 else { return }
+                let stop = CABasicAnimation(keyPath: "transform.rotation.z")
+                stop.fromValue = current
+                stop.toValue = angle
+                stop.duration = coast
+                stop.timingFunction = CAMediaTimingFunction(name: .easeOut)
+                disc.add(stop, forKey: "coast")
             }
         }
     }
@@ -208,10 +248,12 @@ struct RecordDisc: View {
     var spinning = false
     let artwork: NSImage?
     let labelColor: Color
+    /// 38% is where real 12-inch labels sit; tiny discs (the notch) enlarge it so the cover reads.
+    var labelRatio: CGFloat = 0.38
 
     var body: some View {
         let r = diameter / 2
-        let lr = r * 0.33
+        let lr = r * labelRatio
         ZStack {
             Canvas { ctx, _ in
                 let c = CGPoint(x: r, y: r)
@@ -220,7 +262,7 @@ struct RecordDisc: View {
                     Gradient(colors: [Color(white: 0.12), Color(white: 0.045)]), center: c, startRadius: r * 0.3, endRadius: r))
                 ctx.stroke(circlePath(c, r * 0.985), with: .color(.white.opacity(0.07)), lineWidth: 1)
                 if diameter > 60 {
-                    var groove = r * 0.40
+                    var groove = r * 0.44
                     let step = max(1.5, r * 0.018)
                     while groove < r * 0.955 {
                         ctx.stroke(circlePath(c, groove), with: .color(.white.opacity(0.035)), lineWidth: 0.5)
@@ -268,8 +310,8 @@ struct Sleeve: View {
         }
         .frame(width: side, height: side)
         .clipShape(RoundedRectangle(cornerRadius: Radius.sleeve, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: Radius.sleeve, style: .continuous).strokeBorder(.white.opacity(0.10), lineWidth: 0.5))
-        .shadow(color: .black.opacity(0.35), radius: 10, x: 0, y: 6)
+        .overlay(RoundedRectangle(cornerRadius: Radius.sleeve, style: .continuous).strokeBorder(.white.opacity(0.12), lineWidth: 0.5))
+        .layeredShadow(1.1, lift: 0.8)
     }
 }
 
@@ -384,8 +426,9 @@ struct TurntableDeck: View {
 struct PressStyle: ButtonStyle {
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
-            .scaleEffect(configuration.isPressed ? 0.9 : 1)
-            .animation(.spring(duration: 0.2, bounce: 0.3), value: configuration.isPressed)
+            .scaleEffect(configuration.isPressed ? 0.94 : 1)
+            .opacity(configuration.isPressed ? 0.85 : 1)
+            .animation(Motion.press, value: configuration.isPressed)
     }
 }
 
@@ -405,18 +448,22 @@ struct ControlButton: View {
     @State private var hovering = false
 
     var body: some View {
-        let side = (prominent ? 36 : 28) * scale
+        let side = (prominent ? 38 : 30) * scale
         Button(action: action) {
             Image(systemName: symbol)
-                .font(.system(size: (prominent ? 14 : 13) * scale, weight: prominent ? .bold : .semibold))
+                .font(.system(size: (prominent ? 15 : 13) * scale, weight: prominent ? .bold : .semibold))
                 .contentTransition(.symbolEffect(.replace))
-                .foregroundStyle(prominent ? look.onPrimary : (active ? look.accent : look.text))
+                .foregroundStyle(prominent ? look.onPrimary : (active ? look.accent : look.text.opacity(hovering && enabled ? 1 : 0.86)))
+                // A play triangle's visual weight sits left of its box; nudge it to look centred.
+                .offset(x: symbol == "play.fill" ? 1.5 * scale : 0)
                 .frame(width: side, height: side)
                 .background {
                     if prominent {
-                        Circle().fill(look.primary).shadow(color: .black.opacity(0.2), radius: 3, y: 1.5)
+                        Circle().fill(look.primary)
+                            .overlay(Circle().strokeBorder(.white.opacity(0.18), lineWidth: 0.5))
+                            .shadow(color: look.primary.opacity(hovering && enabled ? 0.55 : 0.35), radius: hovering ? 9 : 6, y: 2)
                     } else {
-                        Circle().fill(look.text.opacity(hovering && enabled ? 0.12 : 0))
+                        Circle().fill(look.text.opacity(hovering && enabled ? 0.10 : 0))
                     }
                 }
                 .overlay(alignment: .bottom) {
@@ -424,8 +471,8 @@ struct ControlButton: View {
                         Circle().fill(look.accent).frame(width: 3.5 * scale, height: 3.5 * scale).offset(y: -1 * scale)
                     }
                 }
-                .scaleEffect(prominent && hovering && enabled ? 1.05 : 1)
-                .animation(.easeOut(duration: 0.15), value: hovering)
+                .scaleEffect(prominent && hovering && enabled ? 1.04 : 1)
+                .animation(Motion.hover, value: hovering)
                 .contentShape(Circle())
         }
         .buttonStyle(PressStyle())
@@ -528,19 +575,36 @@ struct Scrubber: View {
     let look: Look
     let onSeek: (Double) -> Void
     @State private var dragFraction: Double?
+    @State private var hovering = false
 
     var body: some View {
         let duration = track?.duration ?? 0
         let fraction = dragFraction ?? (duration > 0 ? min(1, position / duration) : 0)
-        VStack(spacing: 5) {
+        let active = hovering || dragFraction != nil
+        VStack(spacing: 4) {
             GeometryReader { geo in
+                // A thin line at rest that firms up under the pointer, with a knob only while it can be grabbed.
+                let barHeight: CGFloat = dragFraction != nil ? 7 : (hovering ? 5.5 : 3.5)
                 ZStack(alignment: .leading) {
-                    Capsule().fill(look.text.opacity(0.16))
-                    Capsule().fill(look.accent).frame(width: max(4, geo.size.width * fraction))
+                    Capsule().fill(look.text.opacity(active ? 0.20 : 0.14))
+                    Capsule().fill(look.accent).frame(width: max(barHeight, geo.size.width * fraction))
                 }
-                .frame(height: dragFraction == nil ? 4 : 6)
+                .frame(height: barHeight)
+                // An overlay, so the knob never takes layout space (inside the stack it made the bar 11pt tall).
+                .overlay(alignment: .leading) {
+                    Circle().fill(look.accent)
+                        .overlay(Circle().strokeBorder(.white.opacity(0.35), lineWidth: 0.5))
+                        .frame(width: 11, height: 11)
+                        .shadow(color: .black.opacity(0.25), radius: 2, y: 1)
+                        .scaleEffect(active ? 1 : 0.3)
+                        .opacity(active ? 1 : 0)
+                        .offset(x: max(0, min(geo.size.width - 11, geo.size.width * fraction - 5.5)))
+                }
                 .frame(maxHeight: .infinity)
+                .animation(Motion.hover, value: hovering)
+                .animation(Motion.hover, value: dragFraction == nil)
                 .contentShape(Rectangle())
+                .onHover { hovering = $0 }
                 .gesture(DragGesture(minimumDistance: 0)
                     .onChanged { dragFraction = clamp($0.location.x / geo.size.width) }
                     .onEnded { value in
@@ -564,8 +628,9 @@ struct Scrubber: View {
                 Spacer()
                 Text("-" + clock(max(0, duration - fraction * duration)))
             }
-            .font(.system(size: 10.5, weight: .medium, design: .rounded).monospacedDigit())
+            .font(.system(size: 10.5, weight: .medium).monospacedDigit())
             .foregroundStyle(look.muted)
+            .opacity(active ? 1 : 0.8)
             .accessibilityHidden(true)
             .allowsHitTesting(false)
         }
@@ -581,21 +646,28 @@ struct Scrubber: View {
     }
 }
 
-/// Shrinks the open player back to the mini disc. Solid backing so it reads over cover art.
+/// Shrinks the open player back to the mini disc. Over the cover it is a dark smoked disc with a
+/// white glyph, which reads on any artwork; in the header it sits in the look's own colours.
 struct ShrinkButton: View {
     let look: Look
+    var overArt = false
     let action: () -> Void
+    @State private var hovering = false
 
     var body: some View {
         Button(action: action) {
             Image(systemName: "arrow.down.right.and.arrow.up.left")
                 .font(.system(size: 10, weight: .bold))
-                .foregroundStyle(look.text)
+                .foregroundStyle(overArt ? .white : look.text)
                 .frame(width: 26, height: 26)
-                .background(Circle().fill(look.fill ?? Color(nsColor: .windowBackgroundColor)))
-                .overlay(Circle().strokeBorder(look.hairline, lineWidth: 1))
+                .background(Circle().fill(overArt ? Color.black.opacity(hovering ? 0.55 : 0.4)
+                                                  : look.text.opacity(hovering ? 0.14 : 0.08)))
+                .background { if overArt { Circle().fill(.ultraThinMaterial) } }
+                .overlay(Circle().strokeBorder(.white.opacity(overArt ? 0.22 : 0.1), lineWidth: 0.5))
+                .animation(Motion.hover, value: hovering)
                 .contentShape(Circle())
         }
+        .onHover { hovering = $0 }
         .buttonStyle(PressStyle())
         .accessibilityLabel("Shrink to mini disc")
         .help("Shrink to mini disc")
@@ -665,16 +737,18 @@ struct LyricsBlock: View {
             let text = current.map { all[$0].text } ?? ""
             let shown = current == nil ? "" : (text.isEmpty ? "♪" : LyricsSync.revealed(text, progress: lyrics.lineProgress(at: position)))
             ZStack(alignment: .leading) {
+                // Semibold, a step under the title, so the song name stays the headline.
                 Text(shown)
-                    .font(.system(size: size, weight: .bold))
-                    .tracking(-0.4)
+                    .font(.system(size: size, weight: .semibold))
+                    .tracking(-0.2)
                     .foregroundStyle(look.text)
                     .lineLimit(1)
                     .truncationMode(.head)
                     .id(current)
-                    .transition(.opacity)
+                    .transition(.asymmetric(insertion: .opacity.combined(with: .offset(y: 5)),
+                                            removal: .opacity.combined(with: .offset(y: -3))))
             }
-            .animation(.easeOut(duration: 0.18), value: current)
+            .animation(.smooth(duration: 0.25), value: current)
         case .loaded(.plain(let text)):
             // No timing: follow the song's progress, in the secondary colour so it never
             // pretends to be exactly in sync.
@@ -797,6 +871,8 @@ struct PlayerCard: View {
     let events: PanelEvents
     let visualizer: Visualizer
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.accessibilityVoiceOverEnabled) private var voiceOver
+    @State private var hovering = false
 
     static let margin: CGFloat = 28
 
@@ -813,7 +889,7 @@ struct PlayerCard: View {
         let track = hub.nowPlaying
         let playing = track?.isPlaying ?? false
         let width = CGFloat(settings.playerWidth)
-        let inner = width - 36
+        let inner = width - Radius.padding * 2
         let scale = min(1.12, max(0.88, width / 320))
         // "Slide the record back in": the cover stays, only the record goes home.
         let emptyWhilePaused = settings.pausedBehavior == .emptyPlayer && !playing
@@ -824,38 +900,53 @@ struct PlayerCard: View {
         return TimelineView(.animation(minimumInterval: 0.5, paused: !playing)) { timeline in
             let position = track?.position(at: timeline.date) ?? 0
             let spinning = spins && playing
-            VStack(alignment: .leading, spacing: 14) {
+            // Spacing groups what belongs together: art, then the song, then the transport block
+            // (scrubber hugging its buttons), then lyrics.
+            VStack(alignment: .leading, spacing: 0) {
                 if settings.layout != .minimal {
                     deck(inner: inner, spinning: spinning, playing: playing, progress: track?.progress(at: timeline.date) ?? 0,
                          artwork: artwork, hasTrack: track != nil && !emptyWhilePaused, look: look)
                         .frame(width: inner)
                         .allowsHitTesting(false)
                         .accessibilityHidden(true)
+                        .padding(.bottom, 16)
                 }
                 header(look: look, spinning: spinning, artwork: artwork)
-                Scrubber(track: track, position: position, look: look) { hub.seek(to: $0) }
-                if track != nil {
-                    ControlsRow(hub: hub, look: look, controls: settings.controls, scale: scale,
-                                queueOpen: settings.showQueue, onQueue: { settings.showQueue.toggle() })
-                        .frame(maxWidth: .infinity)
+                    .padding(.bottom, 12)
+                VStack(spacing: 6) {
+                    Scrubber(track: track, position: position, look: look) { hub.seek(to: $0) }
+                    if track != nil {
+                        ControlsRow(hub: hub, look: look, controls: settings.controls, scale: scale,
+                                    queueOpen: settings.showQueue, onQueue: { settings.showQueue.toggle() })
+                            .frame(maxWidth: .infinity)
+                    }
                 }
                 if settings.lyricsEnabled {
                     LyricsBlock(lyrics: lyrics, look: look, track: track, fontSize: settings.lyricsFontSize)
+                        .padding(.top, 10)
                 }
                 if settings.showQueue, track != nil {
+                    Rectangle().fill(look.text.opacity(0.08)).frame(height: 1).padding(.vertical, 12)
                     QueueList(hub: hub, look: look)
                 }
             }
-            .padding(18)
+            .padding(Radius.padding)
             .frame(width: width, alignment: .leading)
             .background(WindowDragArea(events: events))
             .overlay(alignment: .topTrailing) {
+                // Window chrome stays out of the way until the pointer is on the player.
                 if settings.layout != .minimal {
-                    ShrinkButton(look: look) { events.onShrink() }.padding(10)
+                    ShrinkButton(look: look, overArt: true) { events.onShrink() }
+                        .padding(Radius.inset + 2)
+                        // Always shown with VoiceOver: a fully transparent view drops out of it.
+                        .opacity(hovering || voiceOver ? 1 : 0)
+                        .scaleEffect(hovering || voiceOver ? 1 : 0.9)
+                        .animation(Motion.hover, value: hovering)
                 }
             }
+            .onHover { hovering = $0 }
             .modifier(CardSurface(look: look))
-            .animation(reduceMotion ? nil : .easeInOut(duration: 0.8), value: look)
+            .animation(reduceMotion ? nil : Motion.colour, value: look)
         }
         .accessibilityElement(children: .contain)
         .accessibilityLabel("Discette player")
@@ -883,19 +974,20 @@ struct PlayerCard: View {
         return HStack(spacing: 12) {
             if settings.layout == .minimal {
                 RecordDisc(diameter: 46, spinning: spinning, artwork: artwork, labelColor: look.accent)
-                    .shadow(color: .black.opacity(0.35), radius: 4, y: 2)
+                    .layeredShadow(1, lift: 0.4)
                     .allowsHitTesting(false)
                     .accessibilityHidden(true)
             }
-            VStack(alignment: .leading, spacing: 2) {
+            VStack(alignment: .leading, spacing: 1) {
                 Text(hub.nowPlaying?.title ?? "Nothing playing")
-                    .font(.system(size: 16, weight: .semibold).width(.expanded))
-                    .tracking(-0.3)
+                    .font(.system(size: 16.5, weight: .semibold))
+                    .tracking(-0.25)
                     .foregroundStyle(look.text)
                 Text(subtitle)
-                    .font(.system(size: 12.5, weight: .regular))
+                    .font(.system(size: 13, weight: .regular))
                     .foregroundStyle(look.muted)
             }
+            .truncationMode(.tail)
             .lineLimit(1)
             .allowsHitTesting(false)
             .accessibilityElement(children: .combine)
@@ -1012,7 +1104,7 @@ struct MenuBarPlayerView: View {
                         .clipShape(RoundedRectangle(cornerRadius: Radius.thumb, style: .continuous))
                         .accessibilityHidden(true)
                         VStack(alignment: .leading, spacing: 2) {
-                            Text(track?.title ?? "Nothing playing").font(.system(size: 14, weight: .semibold).width(.expanded))
+                            Text(track?.title ?? "Nothing playing").font(.system(size: 14.5, weight: .semibold)).tracking(-0.2)
                             Text(track?.artist ?? "Play something in Apple Music or Spotify")
                                 .font(.system(size: 12, weight: .medium)).foregroundStyle(look.muted)
                         }
@@ -1115,7 +1207,7 @@ struct FullScreenPlayerView: View {
                 VStack(alignment: .leading, spacing: 24) {
                     VStack(alignment: .leading, spacing: 6) {
                         Text(track?.title ?? "Nothing playing")
-                            .font(.system(size: 40, weight: .bold).width(.expanded)).tracking(-1)
+                            .font(.system(size: 42, weight: .bold)).tracking(-1.1)
                             .foregroundStyle(look.text)
                         Text(track?.artist ?? "Play something in Apple Music or Spotify")
                             .font(.system(size: 22, weight: .semibold))
@@ -1213,6 +1305,11 @@ struct SettingsView: View {
                 Picker("When music is paused", selection: $settings.pausedBehavior) {
                     ForEach(PausedBehavior.allCases) { Text($0.label).tag($0) }
                 }
+                Toggle(isOn: $settings.notchPlayer) {
+                    Text("Show the song beside the notch")
+                    Text("On MacBooks with a notch: a small record and progress ring sit beside it. Point at the notch to open the controls.")
+                }
+                .disabled(NotchController.notchedScreen == nil && !settings.notchPlayer)
                 Text("Click the mini disc to open the player. Right-click the player or the menu bar icon for every option.")
                     .font(.footnote).foregroundStyle(.secondary)
             }

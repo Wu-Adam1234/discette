@@ -116,6 +116,8 @@ final class AppSettings: ObservableObject {
     /// Seconds added to every song's lyrics (positive = earlier).
     @Published var lyricsDelay: Double { didSet { d.set(lyricsDelay, forKey: "lyricsDelay") } }
     @Published var showQueue: Bool { didSet { d.set(showQueue, forKey: "showQueue") } }
+    /// Song beside the notch on MacBooks that have one. Off unless turned on in Settings.
+    @Published var notchPlayer: Bool { didSet { d.set(notchPlayer, forKey: "notchPlayer") } }
 
     /// Turns a control on or off, keeping the fixed order of `PlayerControl.allCases`.
     func setControl(_ control: PlayerControl, _ on: Bool) {
@@ -156,6 +158,7 @@ final class AppSettings: ObservableObject {
         showVisualizer = bool("showVisualizer", true)
         lyricsDelay = d.object(forKey: "lyricsDelay") as? Double ?? 0
         showQueue = bool("showQueue", false)
+        notchPlayer = bool("notchPlayer", false)
     }
 }
 
@@ -198,6 +201,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let fullScreen = FullScreenPlayerController()
     private var idleTimer: Timer?
     private var settingsWindow: NSWindow?
+    private var notch: NotchController?
     private var bag = Set<AnyCancellable>()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -314,6 +318,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             menuBar.setTitle(nil)
         }
 
+        updateNotch()
         let next = presentation()
         if state.presentation != next { state.presentation = next }
         hub.wantsQueue = settings.showQueue && next == .expanded
@@ -348,6 +353,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private var lastLayoutKey = ""
+
+    /// The notch player exists only while it's turned on and a notched screen is connected; a
+    /// new one is made when the notch moves (display arrangement or resolution changed).
+    private func updateNotch() {
+        let geometry = settings.notchPlayer ? NotchController.notchedScreen.flatMap(NotchController.geometry) : nil
+        guard notch?.model.geometry != geometry else { return }
+        notch?.close()
+        notch = geometry.map { NotchController(geometry: $0, hub: hub, lyrics: lyrics, settings: settings) }
+    }
 
     private func layoutKey(_ presentation: Presentation) -> String {
         // Lyrics are one line at a fixed height whatever they say; only on/off changes the size.
@@ -497,9 +511,11 @@ struct DiscetteMain {
     @MainActor
     static func main() {
         let app = NSApplication.shared
-        let delegate = AppDelegate()
+        // Development: show the notch player in a window instead of running the app.
+        let delegate: NSApplicationDelegate = CommandLine.arguments.contains("--notch-preview")
+            ? NotchPreviewDelegate() : AppDelegate()
         app.delegate = delegate
         app.setActivationPolicy(.accessory)
-        app.run()
+        withExtendedLifetime(delegate) { app.run() }
     }
 }
